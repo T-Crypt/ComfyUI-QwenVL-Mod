@@ -29,11 +29,7 @@ from chat_service import (
     _is_image_enhancer_node,
     _has_image_enhancer_target,
     ensure_i2va_binding,
-    ensure_minimax_dialogue,
-    ensure_minimax_music,
-    expand_section_vars,
     normalize_minimax_output,
-    resolve_section_vars,
 )
 
 
@@ -566,36 +562,6 @@ class ChatProtocolTests(unittest.TestCase):
         self.assertTrue(result.startswith(MINIMAX_I2VA_BINDING))
         self.assertNotIn(malformed, result)
 
-    def test_ensure_minimax_dialogue_injects_missing_i2va_dialogue(self):
-        body = f"{MINIMAX_I2VA_BINDING}\n\nintegrated_multimodal_description: [Shot 1] A woman smiles.\noverall_soundscape: Quiet room.\nnon_diegetic_music: N/A"
-        prompt = '(S1) says "Today we are gonna explore the world of AI video generation"'
-        result = ensure_minimax_dialogue(body, prompt, "MiniMax › NSFW", has_image=True)
-        self.assertIn("(S1) speaks:", result)
-        self.assertIn("<d>[English] Today we are gonna explore the world of AI video generation</d>", result)
-        self.assertEqual(result.count("Today we are gonna explore the world of AI video generation"), 1)
-
-    def test_ensure_minimax_dialogue_injects_language_tag(self):
-        body = "integrated_multimodal_description: [Shot 1] A woman smiles.\noverall_soundscape: Quiet room."
-        prompt = '(S1) dice [IT] "Ciao a tutti"'
-        result = ensure_minimax_dialogue(body, prompt, "MiniMax › NSFW R2VA", has_image=True)
-        self.assertIn('(S1) speaks: <d>[Italian] Ciao a tutti</d>', result)
-
-    def test_ensure_minimax_dialogue_injects_offscreen_voice(self):
-        body = "integrated_multimodal_description: [Shot 1] A woman smiles.\noverall_soundscape: Quiet room."
-        prompt = '(VO) dice "Narratore misterioso"'
-        result = ensure_minimax_dialogue(body, prompt, "MiniMax › NSFW R2VA", has_image=True)
-        self.assertIn('says in an off-screen voiceover: <d>[English] Narratore misterioso</d>', result)
-
-    def test_ensure_minimax_dialogue_skips_already_present(self):
-        body = 'integrated_multimodal_description: [Shot 1] (S1) speaks: <d>[Italian] Ciao</d>\noverall_soundscape: Quiet room.'
-        prompt = '(S1) dice [IT] "Ciao"'
-        self.assertEqual(ensure_minimax_dialogue(body, prompt, "MiniMax › NSFW R2VA", has_image=True), body)
-
-    def test_ensure_minimax_dialogue_ignores_non_minimax(self):
-        body = "integrated_multimodal_description: [Shot 1] A woman smiles.\noverall_soundscape: Quiet room."
-        prompt = '(S1) says "Hello"'
-        self.assertEqual(ensure_minimax_dialogue(body, prompt, "Other preset", has_image=True), body)
-
     def test_normalize_minimax_keeps_fl2va_alignment(self):
         alignment = "How the reference pictures align with the target video — Picture 1 (from [Shot 1]) aligns with the 0.00-second mark; Picture 2 aligns with the 5.00-second mark."
         body = "integrated_multimodal_description: [Shot 1] ...\noverall_soundscape: ...\nnon_diegetic_music: N/A"
@@ -610,116 +576,6 @@ class ChatProtocolTests(unittest.TestCase):
         self.assertTrue(result.startswith("How the reference pictures align"))
         self.assertIn("10.00-second mark", result)
         self.assertIn("integrated_multimodal_description:", result)
-
-    def test_expand_section_vars_resolves_bare_tags(self):
-        prompt = (
-            "--SCENE--\n"
-            "1. La camera inizia sul frontale, fanali accesi, [VFX].\n"
-            "2. La telecamera scorre lungo la fiancata, vento tra i capelli, [MUSIC].\n"
-            "--VFX--\n"
-            "lens flare\n"
-            "--MUSIC--\n"
-            "dallo stereo suona a tense electronic drone with deep bass pulses a volume alto\n"
-        )
-        result = expand_section_vars(prompt)
-        self.assertIn("fanali accesi, lens flare.", result)
-        self.assertIn("la fiancata, vento tra i capelli, dallo stereo suona a tense electronic drone", result)
-        self.assertNotIn("[VFX]", result)
-        self.assertNotIn("[MUSIC]", result)
-
-    def test_expand_section_vars_dedups_shared_prefix(self):
-        prompt = (
-            "--SCENE--\n"
-            "1. dallo stereo suona [MUSIC].\n"
-            "--MUSIC--\n"
-            "dallo stereo suona a tense electronic drone\n"
-        )
-        result = expand_section_vars(prompt)
-        self.assertIn("dallo stereo suona a tense electronic drone.", result)
-        self.assertNotIn("suona dallo stereo", result)
-
-    def test_expand_section_vars_keeps_inline_directives(self):
-        prompt = (
-            "--SCENE--\n"
-            "1. Zoom sul soggetto, [VFX] lens flare, poi fade.\n"
-            "--VFX--\n"
-            "particle burst\n"
-        )
-        result = expand_section_vars(prompt)
-        self.assertIn("1. Zoom sul soggetto, [VFX] lens flare, poi fade.", result)
-
-    def test_expand_section_vars_ignores_language_tags(self):
-        prompt = '(S1) dice [IT] "Ciao", poi [EN] "Hello".'
-        self.assertEqual(expand_section_vars(prompt), prompt)
-
-    def test_expand_section_vars_leaves_freeform_prompt(self):
-        prompt = "A jeep drives on a coastal road at sunset."
-        self.assertEqual(expand_section_vars(prompt), prompt)
-
-    def test_resolve_section_vars_replaces_leaked_bare_tag(self):
-        text = "[Shot 1] Camera moves, [VFX].\noverall_soundscape: quiet."
-        result = resolve_section_vars(text, "--VFX--\nlens flare\n")
-        self.assertIn("Camera moves, lens flare.", result)
-        self.assertNotIn("[VFX]", result)
-
-    def test_resolve_section_vars_strips_directive_tags(self):
-        text = "[Shot 1] Camera zooms, [MUSIC] tense drone plays.\noverall_soundscape: quiet."
-        result = resolve_section_vars(text, "freeform prompt")
-        self.assertNotIn("[MUSIC]", result)
-        self.assertIn("tense drone plays", result)
-
-    def test_resolve_section_vars_recovers_dropped_inline_directive(self):
-        prompt = "1. Zoom, [VFX] lens flare.\n"
-        text = "[Shot 1] Camera zooms.\n[Shot 2] Fade.\noverall_soundscape: quiet."
-        result = resolve_section_vars(text, prompt)
-        self.assertIn("lens flare", result)
-
-    def test_ensure_minimax_music_fills_from_section(self):
-        body = "integrated_multimodal_description: [Shot 1] A jeep drives.\noverall_soundscape: quiet.\nnon_diegetic_music: N/A"
-        prompt = "--SCENE--\n1. Zoom, [MUSIC].\n--MUSIC--\ndallo stereo suona a tense electronic drone\n"
-        result = ensure_minimax_music(body, prompt, "MiniMax › SFW R2VA")
-        self.assertIn("non_diegetic_music: dallo stereo suona a tense electronic drone", result)
-
-    def test_ensure_minimax_music_fills_from_inline_tag(self):
-        body = "integrated_multimodal_description: [Shot 1] A jeep drives.\noverall_soundscape: quiet.\nnon_diegetic_music: N/A"
-        prompt = "1. Zoom, [MUSIC] tense electronic drone."
-        result = ensure_minimax_music(body, prompt, "MiniMax › SFW R2VA")
-        self.assertIn("non_diegetic_music: tense electronic drone", result)
-
-    def test_ensure_minimax_dialogue_wraps_paraphrased_voiceover(self):
-        body = (
-            'integrated_multimodal_description: [Shot 3] The scene dissolves to black '
-            'as a voiceover intones, "Singularity. One model to rule them all."\n'
-            'overall_soundscape: quiet.'
-        )
-        prompt = '(VO) dice [EN] "Singularity. One model to rule them all."'
-        result = ensure_minimax_dialogue(body, prompt, "MiniMax › SFW R2VA", has_image=True)
-        self.assertIn("<d>[English] Singularity. One model to rule them all.</d>", result)
-        self.assertNotIn('"Singularity', result)
-
-    def test_ensure_minimax_dialogue_moves_d_out_of_summary(self):
-        body = (
-            'summary: A voiceover whispers in English: <d>[English] Singularity. One model to rule them all.</d> Fade to black.\n'
-            'detailed_description:\n[Shot 1] A jeep drives.\n'
-            '[Shot 3] a smooth voiceover whispers in English: "Singularity. One model to rule them all."\n'
-            'overall_soundscape: quiet.'
-        )
-        prompt = '(VO) dice [EN] "Singularity. One model to rule them all."'
-        result = ensure_minimax_dialogue(body, prompt, "MiniMax › SFW R2VA", has_image=True)
-        self.assertIn('whispers in English: "Singularity. One model to rule them all." Fade', result)
-        self.assertIn('[Shot 3] a smooth voiceover whispers in English: <d>[English] Singularity. One model to rule them all.</d>', result)
-        self.assertEqual(result.count("<d>"), 1)
-
-    def test_ensure_minimax_dialogue_wraps_paraphrased_subject(self):
-        body = (
-            'integrated_multimodal_description: [Shot 2] She turns to camera and says, '
-            '"Un famoso esploratore una volta disse."\noverall_soundscape: quiet.'
-        )
-        prompt = '(S1) dice [IT] "Un famoso esploratore una volta disse."'
-        result = ensure_minimax_dialogue(body, prompt, "MiniMax › SFW R2VA", has_image=True)
-        self.assertIn("<d>[Italian] Un famoso esploratore una volta disse.</d>", result)
-        self.assertNotIn('"Un famoso', result)
-
 
 if __name__ == "__main__":
     unittest.main()
