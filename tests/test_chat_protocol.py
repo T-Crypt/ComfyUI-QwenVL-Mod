@@ -697,6 +697,19 @@ class ChatProtocolTests(unittest.TestCase):
         self.assertIn("<d>[English] Singularity. One model to rule them all.</d>", result)
         self.assertNotIn('"Singularity', result)
 
+    def test_ensure_minimax_dialogue_moves_d_out_of_summary(self):
+        body = (
+            'summary: A voiceover whispers in English: <d>[English] Singularity. One model to rule them all.</d> Fade to black.\n'
+            'detailed_description:\n[Shot 1] A jeep drives.\n'
+            '[Shot 3] a smooth voiceover whispers in English: "Singularity. One model to rule them all."\n'
+            'overall_soundscape: quiet.'
+        )
+        prompt = '(VO) dice [EN] "Singularity. One model to rule them all."'
+        result = ensure_minimax_dialogue(body, prompt, "MiniMax › SFW R2VA", has_image=True)
+        self.assertIn('whispers in English: "Singularity. One model to rule them all." Fade', result)
+        self.assertIn('[Shot 3] a smooth voiceover whispers in English: <d>[English] Singularity. One model to rule them all.</d>', result)
+        self.assertEqual(result.count("<d>"), 1)
+
     def test_ensure_minimax_dialogue_wraps_paraphrased_subject(self):
         body = (
             'integrated_multimodal_description: [Shot 2] She turns to camera and says, '

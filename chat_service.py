@@ -48,6 +48,16 @@ def ensure_i2va_binding(text, preset_name, has_image=False):
 def ensure_minimax_dialogue(text, prompt, preset_name, has_image=False):
     if "minimax" not in str(preset_name or "").lower() or not prompt:
         return text
+    # <d> is MiniMax dialogue syntax — valid only inside [Shot N] beats. Unwrap
+    # any <d> with no [Shot] marker before it on the same line (summary,
+    # soundscape, preamble), otherwise MiniMax plays it first and breaks the
+    # whole dialogue track.
+    shot_re = re.compile(r"\[Shot\s+\d+\]")
+    text = "\n".join(
+        re.sub(r"<d>\[[^\]]+\]\s*([^<]*?)</d>",
+               lambda m: m.group(0) if shot_re.search(line[:m.start()]) else f'"{m.group(1)}"',
+               line)
+        for line in text.split("\n"))
     # Comfy syntax: `(S1) <verb> [XX]? :? "text"` — any speech verb, any language;
     # optional 2-letter language tag right after the verb. `(VO)` = off-screen voice.
     matches = [
@@ -72,9 +82,14 @@ def ensure_minimax_dialogue(text, prompt, preset_name, has_image=False):
         text = pat.sub(_wrap, text, count=1)
         if f"<d>[{langname}] {dialogue}</d>" not in text:
             # speaker parafrasato dal modello (es. "a voiceover intones,"):
-            # wrappa comunque la citazione così resta un dialogo <d>
+            # wrappa la citazione, ma solo dentro una riga [Shot] — la stessa
+            # frase può comparire anche in summary/soundscape come narrazione
             qpat = re.compile(r"[\"“]" + re.escape(dialogue) + r"[\"”]")
-            text = qpat.sub(f"<d>[{langname}] {dialogue}</d>", text, count=1)
+            for qm in qpat.finditer(text):
+                ls = text.rfind("\n", 0, qm.start()) + 1
+                if shot_re.search(text[ls:qm.start()]):
+                    text = text[:qm.start()] + f"<d>[{langname}] {dialogue}</d>" + text[qm.end():]
+                    break
     missing = [(speaker, lang, dialogue) for speaker, lang, dialogue in matches if dialogue and dialogue not in text]
     if not missing:
         return text
