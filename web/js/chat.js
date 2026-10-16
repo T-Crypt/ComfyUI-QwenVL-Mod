@@ -1121,7 +1121,7 @@ async function sendMessage() {
             state.messages.push({ role: "assistant", content: formatAnswer(data.message, result.applied, result.rejected), thinking: data.thinking || "", choices: [] });
             const feedback = result.observations
                 .concat(result.rejected.map((item) => `REJECTED: ${item}`))
-                .concat(!parsed ? ["Your previous reply was not a JSON object and applied no changes. Return ONLY the JSON object: {\"message\":\"...\",\"actions\":[...],\"choices\":[]}. No preamble, no extra text."] : [])
+                .concat(!parsed ? ["Your previous reply was not a JSON object and applied no changes. Output exactly one JSON object starting with { and ending with }, no prose, no analysis, no think tags, no markdown:\n{\"message\":\"Fixed KSampler widgets\",\"actions\":[{\"type\":\"set_widget_value\",\"node_id\":12,\"widget\":\"steps\",\"value\":20}],\"choices\":[]}\nFor fixes with multiple nodes, fix ONE widget per message — e.g. \"set steps to 20 on node 12\". The panel applies each action and you can continue with the next."] : [])
                 .join("\n").slice(0, 6000);
             state.messages.push({ role: "user", content: `OBSERVATION — previous-round results, continue the task:\n${feedback}` });
             state.messages = state.messages.slice(-20);

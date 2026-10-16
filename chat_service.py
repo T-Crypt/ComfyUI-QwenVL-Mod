@@ -172,13 +172,17 @@ def normalize_minimax_output(text, preset_name, has_image=False, duration=None):
     return ensure_i2va_binding(prefix + tail.lstrip(), preset_name, has_image)
 
 
-BASE_SYSTEM_PROMPT = """You are Qwen Workflow Assistant inside ComfyUI. Answer the user and, only when requested, control the open workflow using the supplied snapshot.
+BASE_SYSTEM_PROMPT = """You are Qwen Workflow Assistant inside ComfyUI. CRITICAL: your entire response must be exactly one JSON object — no text before or after it, no think tags, no analysis, no explanation. If you output anything besides JSON, the workflow will not be modified. Answer the user via the "message" field and, only when requested, control the open workflow using the supplied snapshot.
 LANGUAGE: "message" and choice labels must mirror the LATEST user message language. Workflow prompt text must be English.
 OUTPUT: return exactly one JSON object, no text outside it:
 {"message":"reply","actions":[{"type":"set_widget_value","node_id":1,"widget":"steps","value":25},{"type":"queue_workflow"}],"choices":[{"label":"A","send":"text for A"}]}
+Example: to fix scrambled KSampler widgets:
+{"message":"Fixed KSampler 12: steps 20, cfg 1, sampler euler, scheduler simple, control_after_generate fixed","actions":[{"type":"set_widget_value","node_id":12,"widget":"steps","value":20},{"type":"set_widget_value","node_id":12,"widget":"cfg","value":1},{"type":"set_widget_value","node_id":12,"widget":"sampler_name","value":"euler"},{"type":"set_widget_value","node_id":12,"widget":"scheduler","value":"simple"},{"type":"set_widget_value","node_id":12,"widget":"control_after_generate","value":"fixed"}],"choices":[]}
+Your response must START with "{" and END with "}". Do not analyze, explain, or describe anything before or after the JSON object.
 Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow, add_node, remove_node, connect, disconnect, layout, search_models, download_model, clear_graph, queue_status, queue_cancel, workflow_list, workflow_save, workflow_load, workflow_delete. Never invent numeric node IDs or widget names — nodes you create are referenced by the key you assign them (see 4). Never emit code, shell, filesystem, JS, or network actions.
 When asked to generate/run/queue, apply every required widget update and include queue_workflow in the same response. Never ask "execute now?" after queue_workflow. If you only set a prompt without queue_workflow, do not claim execution started.
 When asked to fix or resolve errors in the workflow, emit the correcting actions (set_widget_value, connect, disconnect, ...) and include queue_workflow when the user wants it run — describing the errors is not enough.
+When a fix involves multiple nodes or widgets, emit ONE action per response (e.g. one set_widget_value). The panel applies it and you can continue with the next fix in the following round. Do not try to fix everything at once.
 Choices are top-level, only when truly ambiguous. Always close braces.
 ---
 WORKFLOW TARGETS (pick the FIRST matching case for the node you are controlling):
@@ -220,7 +224,7 @@ _GT = chr(62)
 THINK_OPEN = _LT + "think" + _GT
 THINK_CLOSE = _LT + "/think" + _GT
 THINKING_INSTRUCTION = " Put your step-by-step reasoning inside " + THINK_OPEN + "..." + THINK_CLOSE + " tags, then return the JSON object after the closing " + THINK_CLOSE + " tag."
-NO_THINKING_INSTRUCTION = " Do not output reasoning tags; return only the JSON object."
+NO_THINKING_INSTRUCTION = " Do not output reasoning tags. Your response must be exactly one JSON object starting with { and ending with }. No prose, no analysis, no explanation, no markdown fences. Output format example: {\"message\":\"Fixed 4 KSampler widgets\",\"actions\":[{\"type\":\"set_widget_value\",\"node_id\":12,\"widget\":\"steps\",\"value\":20}],\"choices\":[]}."
 
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + NO_THINKING_INSTRUCTION
 
@@ -1656,11 +1660,17 @@ class ChatRuntime:
         while not result.get("parsed") and attempts < MAX_JSON_ATTEMPTS:
             attempts += 1
             if attempts == 2:
-                reminder = ("Return ONLY the JSON object described in the system instructions — "
-                            "no preamble, no extra text, no markdown fences.")
+                reminder = (
+                    "FAILURE: You did not return a JSON object. Output EXACTLY one JSON object and nothing else:\n"
+                    '{"message":"Brief summary of fixes","actions":[{"type":"set_widget_value","node_id":12,"widget":"steps","value":20}],"choices":[]}\n'
+                    "No prose, no analysis, no think tags, no markdown fences. Copy this structure, fill in the actual actions, output only the JSON."
+                )
             else:
-                reminder = ("Your previous replies were not JSON objects. Return exactly one JSON object: "
-                            "{\"message\":\"...\",\"actions\":[...],\"choices\":[]}. No prose, no reasoning tags.")
+                reminder = (
+                    "FINAL FAILURE: Your previous replies were not JSON objects. Output exactly this structure and nothing else:\n"
+                    '{"message":"Fixed KSampler widgets","actions":[{"type":"set_widget_value","node_id":12,"widget":"control_after_generate","value":"fixed"},{"type":"set_widget_value","node_id":12,"widget":"steps","value":20},{"type":"set_widget_value","node_id":12,"widget":"cfg","value":1},{"type":"set_widget_value","node_id":12,"widget":"sampler_name","value":"euler"},{"type":"set_widget_value","node_id":12,"widget":"scheduler","value":"simple"}],"choices":[]}\n'
+                    "Replace the example node ids and values with the actual fixes. No prose before or after. Only JSON."
+                )
             retry_messages = messages + [
                 {"role": "assistant", "content": (text or "")[:2000]},
                 {"role": "user", "content": "Your reply was not a JSON object and applied no workflow changes. " + reminder},
