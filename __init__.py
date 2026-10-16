@@ -1,8 +1,11 @@
 import asyncio
 import html
 import importlib.util
+import json
 import os
+import re
 import sys
+import urllib.parse
 import urllib.request
 
 from aiohttp import web
@@ -89,6 +92,7 @@ if os.path.exists(nodes_dir):
     load_modules_from_directory(nodes_dir)
 
 from chat_service import CHAT_RUNTIME, list_output_images
+from chat_service import DOWNLOAD_KINDS, civitai_search, download_model
 
 
 _LLAMA_SWAP_URL = os.environ.get("LLAMA_SWAP_URL", "http://127.0.0.1:9090")
@@ -107,44 +111,6 @@ def _llamaswap_unload(model):
         print(f"[QwenVL Chat] llama-swap unload {model}: {error}")
 
 
-@PromptServer.instance.routes.get("/qwenvl/chat/models")
-async def _chat_models(request):
-    return web.json_response(CHAT_RUNTIME.models())
-
-
-@PromptServer.instance.routes.get("/qwenvl/chat/assets")
-async def _chat_assets(request):
-    return web.json_response(await asyncio.to_thread(list_output_images, folder_paths.get_output_directory()))
-
-
-@PromptServer.instance.routes.post("/qwenvl/chat")
-async def _chat(request):
-    try:
-        data = await request.json()
-        if not isinstance(data, dict):
-            raise ValueError("request body must be an object")
-        options = data.get("options") or {}
-        if not isinstance(options, dict):
-            raise ValueError("options must be an object")
-        result = await asyncio.to_thread(
-            CHAT_RUNTIME.chat,
-            data.get("backend"),
-            data.get("model"),
-            data.get("messages"),
-            data.get("graph"),
-            options,
-            data.get("images"),
-            data.get("video"),
-            data.get("directives"),
-        )
-        return web.json_response(result)
-    except ValueError as error:
-        return web.json_response({"error": str(error)}, status=400)
-    except Exception as error:
-        print(f"[QwenVL Chat] {error}")
-        return web.json_response({"error": "Chat generation failed. Check the ComfyUI console."}, status=500)
-
-
 @PromptServer.instance.routes.post("/qwenvl/chat/unload")
 async def _chat_unload(request):
     try:
@@ -159,6 +125,51 @@ async def _chat_unload(request):
         return web.json_response({"status": "success", "unloaded": unloaded})
     except ValueError as error:
         return web.json_response({"error": str(error)}, status=400)
+
+
+@PromptServer.instance.routes.get("/qwenvl/models/search")
+async def _models_search(request):
+    try:
+        query = (request.query.get("q") or "").strip()
+        if not query:
+            raise ValueError("missing search query")
+        if len(query) > 300:
+            raise ValueError("search query too long")
+        items = await asyncio.to_thread(
+            civitai_search, query, request.query.get("types", ""), request.query.get("limit", "8"))
+        return web.json_response({"items": items})
+    except ValueError as error:
+        return web.json_response({"error": str(error)}, status=400)
+    except Exception as error:
+        print(f"[QwenVL Chat] model search: {error}")
+        return web.json_response({"error": "Model search failed. Check the ComfyUI console."}, status=500)
+
+
+@PromptServer.instance.routes.post("/qwenvl/models/download")
+async def _models_download(request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("request body must be an object")
+        url = data.get("url")
+        kind = data.get("kind")
+        if not isinstance(url, str) or not url or len(url) > 2000:
+            raise ValueError("invalid download URL")
+        if kind not in DOWNLOAD_KINDS:
+            raise ValueError(f"unknown model kind '{kind}'")
+        filename = data.get("filename")
+        if filename is not None and (not isinstance(filename, str) or len(filename) > 200):
+            raise ValueError("invalid filename")
+        token = data.get("token")
+        if token is not None and (not isinstance(token, str) or len(token) > 500):
+            raise ValueError("invalid token")
+        result = await asyncio.to_thread(download_model, url, kind, filename, token)
+        return web.json_response({"status": "success", **result})
+    except ValueError as error:
+        return web.json_response({"error": str(error)}, status=400)
+    except Exception as error:
+        print("[QwenVL Chat] model download failed (URL and token redacted from log)")
+        return web.json_response({"error": "Model download failed. Check the ComfyUI console."}, status=500)
 
 
 NODE_CLASS_MAPPINGS = dict(sorted(NODE_CLASS_MAPPINGS.items(), key=lambda x: NODE_DISPLAY_NAME_MAPPINGS.get(x[0], x[0])))

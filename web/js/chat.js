@@ -25,6 +25,7 @@ const TRANSLATIONS = {
         imageAttached: "Image attached: it will be used instead of workflow images", videoAttached: "Video attached: sampled frames will be sent to Qwen", attachedVideo: "Attached video", nothingToRepeat: "No message to repeat",
         newConversation: "New conversation", placeholder: "Example: set 25 steps in KSampler and run the workflow",
         unloadError: "Unable to unload the chat model from memory", workflowQueued: "workflow added to the queue",
+        selfCorrecting: "Self-correcting…",
         invalidNumber: "{widget}: invalid numeric value", invalidBoolean: "{widget}: invalid boolean value",
         unavailableOption: "{widget}: option is not available", invalidText: "{widget}: invalid text value",
         missingNode: "node {node} does not exist", missingWidget: "widget {widget} does not exist on node {node}",
@@ -51,6 +52,7 @@ const TRANSLATIONS = {
         imageAttached: "Immagine allegata: sarà usata al posto di quelle del workflow", videoAttached: "Video allegato: i frame campionati saranno inviati a Qwen", attachedVideo: "Video allegato", nothingToRepeat: "Nessun messaggio da ripetere",
         newConversation: "Nuova conversazione", placeholder: "Es: imposta 25 step nel KSampler e avvia il workflow",
         unloadError: "Impossibile scaricare il modello chat dalla memoria", workflowQueued: "workflow aggiunto alla coda",
+        selfCorrecting: "Autocorrezione…",
         invalidNumber: "{widget}: valore numerico non valido", invalidBoolean: "{widget}: valore booleano non valido",
         unavailableOption: "{widget}: opzione non disponibile", invalidText: "{widget}: valore testuale non valido",
         missingNode: "nodo {node} inesistente", missingWidget: "widget {widget} inesistente nel nodo {node}",
@@ -72,6 +74,7 @@ const DEFAULT_STATE = {
     temperature: 0.2,
     thinking: false,
     config: "auto",
+    civitaiKey: "",
     messages: [],
 };
 
@@ -683,10 +686,47 @@ function layoutGraph() {
     return moved;
 }
 
+async function runModelSearch(action) {
+    const params = new URLSearchParams({ q: action.query, limit: "8" });
+    if (action.types) params.set("types", action.types);
+    const response = await api.fetchApi(`/qwenvl/models/search?${params.toString()}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    const items = Array.isArray(data.items) ? data.items.slice(0, 8) : [];
+    if (!items.length) return `search "${action.query}" returned no results`;
+    const lines = items.map((item, index) => {
+        const versions = (item.versions || []).map((v) =>
+            `${v.name || v.id} (${v.baseModel || "?"}, ${Math.round((v.sizeKB || 0) / 1024)}MB): ${v.url}`).join(" | ");
+        return `${index + 1}. ${item.name} [${item.type}]: ${versions}`;
+    });
+    return `search "${action.query}" (${items.length} hits):\n${lines.join("\n")}`;
+}
+
+async function runModelDownload(action) {
+    const response = await api.fetchApi("/qwenvl/models/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Model files are gigabytes: no client timeout, Stop still aborts.
+        timeoutMs: null,
+        signal: controller?.signal,
+        body: JSON.stringify({
+            url: action.url,
+            kind: action.kind,
+            filename: action.filename,
+            token: state.civitaiKey || undefined,
+        }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    return `downloaded ${data.filename} (${Math.round((data.bytes || 0) / 1048576)}MB) as ${data.kind} — use exactly '${data.filename}' in widgets`;
+}
+
 async function applyActions(actions) {
     const applied = [];
     const rejected = [];
+    const observations = [];
     let shouldQueue = false;
+    let queued = false;
     const keyToId = new Map();
     const resolveNode = (ref) => {
         const mapped = keyToId.get(String(ref));
@@ -762,6 +802,18 @@ async function applyActions(actions) {
                     node.disconnectInput(inIndex);
                     applied.push(`node ${action.node_id}: disconnected input ${action.input}`);
                 }
+            } else if (action.type === "search_models") {
+                const text = await runModelSearch(action);
+                applied.push(`searched CivitAI for "${action.query}"`);
+                observations.push(text.slice(0, 3000));
+            } else if (action.type === "download_model") {
+                const text = await runModelDownload(action);
+                applied.push(`downloaded model (${action.kind})`);
+                observations.push(text.slice(0, 1000));
+            } else if (action.type === "clear_graph") {
+                const count = (app.graph?._nodes || []).length;
+                app.graph.clear();
+                applied.push(`cleared ${count} node(s)`);
             } else if (action.type === "set_widget_value") {
                 const node = resolveNode(action.node_id);
                 if (!node) {
@@ -810,8 +862,9 @@ async function applyActions(actions) {
         if (!response.ok) throw new Error(t("unloadError"));
         await app.queuePrompt();
         applied.push(t("workflowQueued"));
+        queued = true;
     }
-    return { applied, rejected };
+    return { applied, rejected, observations, queued };
 }
 
 function setBusy(busy) {
@@ -823,12 +876,20 @@ function setBusy(busy) {
     elements.maxTokens.disabled = busy;
     elements.temperature.disabled = busy;
     elements.thinking.disabled = busy;
+    elements.civitaiKey.disabled = busy;
     elements.attach.disabled = busy;
     elements.assetsButton.disabled = busy;
     elements.settingsToggle.disabled = busy;
     for (const button of elements.languageButtons || []) button.disabled = busy;
     if (elements.removeAttachment) elements.removeAttachment.disabled = busy;
     elements.status?.classList.toggle("busy", busy);
+}
+
+function formatAnswer(message, applied, rejected) {
+    let answer = message || t("completed");
+    if (applied.length) answer += `\n\n${t("applied")}:\n- ${applied.join("\n- ")}`;
+    if (rejected.length) answer += `\n\n${t("rejected")}:\n- ${rejected.join("\n- ")}`;
+    return answer;
 }
 
 async function sendMessage() {
@@ -864,40 +925,61 @@ async function sendMessage() {
         setStatus(t("analyzingWorkflow"));
     }
     try {
-        const response = await api.fetchApi("/qwenvl/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            signal: controller.signal,
-            // Chat calls outlive ComfyUI frontend's default fetch timeout
-            // (cold model load alone is ~50s): only the Stop button aborts.
-            timeoutMs: null,
-            body: JSON.stringify({
-                backend: modelBackend(),
-                model: bareModel(),
-                messages: state.messages.map((m) => ({ ...m, content: String(m.content).slice(0, MAX_MESSAGE_CHARS) })),
-                graph: snapshotGraph(),
-                images,
-                video: attachedVideo?.frames || [],
-                directives: { config, text: rawText },
-                options: {
-                    max_tokens: state.maxTokens,
-                    temperature: state.temperature,
-                    top_p: 0.9,
-                    repetition_penalty: 1.05,
-                    quantization: "8-bit (Balanced)",
-                    attention_mode: "auto",
-                    device: "auto",
-                    seed: Math.floor(Math.random() * 4294967294) + 1,
-                    thinking: state.thinking,
-                },
-            }),
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-        const result = await applyActions(data.actions);
-        let answer = data.message || t("completed");
-        if (result.applied.length) answer += `\n\n${t("applied")}:\n- ${result.applied.join("\n- ")}`;
-        if (result.rejected.length) answer += `\n\n${t("rejected")}:\n- ${result.rejected.join("\n- ")}`;
+        // Agent loop: act, observe (tool results feed back as OBSERVATION
+        // messages with a fresh graph snapshot), continue — up to 3 rounds.
+        // Observations earn extra rounds; bare rejections earn one retry.
+        // A queued workflow always ends the loop.
+        const MAX_ROUNDS = 3;
+        let data = null;
+        let result = { applied: [], rejected: [], observations: [], queued: false };
+        for (let round = 0; ; round++) {
+            const firstRound = round === 0;
+            if (!firstRound) setStatus(t("selfCorrecting"));
+            const response = await api.fetchApi("/qwenvl/chat", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                signal: controller.signal,
+                // Chat calls outlive ComfyUI frontend's default fetch timeout
+                // (cold model load alone is ~50s): only the Stop button aborts.
+                timeoutMs: null,
+                body: JSON.stringify({
+                    backend: modelBackend(),
+                    model: bareModel(),
+                    messages: state.messages.map((m) => ({ ...m, content: String(m.content).slice(0, MAX_MESSAGE_CHARS) })),
+                    graph: snapshotGraph(),
+                    images: firstRound ? images : [],
+                    video: firstRound ? attachedVideo?.frames || [] : [],
+                    directives: firstRound ? { config, text: rawText } : { config: "auto", text: "" },
+                    options: {
+                        max_tokens: state.maxTokens,
+                        temperature: state.temperature,
+                        top_p: 0.9,
+                        repetition_penalty: 1.05,
+                        quantization: "8-bit (Balanced)",
+                        attention_mode: "auto",
+                        device: "auto",
+                        seed: Math.floor(Math.random() * 4294967294) + 1,
+                        thinking: state.thinking,
+                    },
+                }),
+            });
+            data = await response.json();
+            if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+            result = await applyActions(data.actions);
+            const hadActions = Array.isArray(data.actions) && data.actions.length > 0;
+            const wantMore = !result.queued && hadActions
+                && (result.observations.length > 0 ? round < MAX_ROUNDS - 1 : result.rejected.length > 0 && round < 1);
+            if (!wantMore) break;
+            state.messages.push({ role: "assistant", content: formatAnswer(data.message, result.applied, result.rejected), thinking: data.thinking || "", choices: [] });
+            const feedback = result.observations
+                .concat(result.rejected.map((item) => `REJECTED: ${item}`))
+                .join("\n").slice(0, 6000);
+            state.messages.push({ role: "user", content: `OBSERVATION — previous-round results, continue the task:\n${feedback}` });
+            state.messages = state.messages.slice(-20);
+            saveState();
+            renderMessages();
+        }
+        const answer = formatAnswer(data.message, result.applied, result.rejected);
         const responseActions = Array.isArray(data.actions) ? data.actions : [];
         const promptWasSet = responseActions.some((action) => action.type === "set_widget_value" && ["prompt", "custom_prompt", "prompt_text"].includes(action.widget));
         const workflowWasQueued = responseActions.some((action) => action.type === "queue_workflow");
@@ -1063,11 +1145,17 @@ function buildSidebar(container) {
     elements.thinking.type = "checkbox";
     elements.thinking.checked = state.thinking;
     elements.thinking.title = "Show model reasoning before the answer";
+    elements.civitaiKey = createElement("input");
+    elements.civitaiKey.type = "password";
+    elements.civitaiKey.value = state.civitaiKey || "";
+    elements.civitaiKey.placeholder = "civitai.com API key";
+    elements.civitaiKey.title = "CivitAI API key for model downloads (stored in this browser only)";
     controls.append(
         createElement("label", "", t("model")), elements.model,
         createElement("label", "", t("maxTokens")), elements.maxTokens,
         createElement("label", "", t("temperature")), elements.temperature,
         createElement("label", "", t("thinking")), elements.thinking,
+        createElement("label", "", "CivitAI key"), elements.civitaiKey,
     );
     elements.messages = createElement("div", "qwen-chat-messages");
     elements.input = createElement("textarea", "qwen-chat-input");
@@ -1145,6 +1233,10 @@ function buildSidebar(container) {
     });
     elements.thinking.addEventListener("change", () => {
         state.thinking = elements.thinking.checked;
+        saveState();
+    });
+    elements.civitaiKey.addEventListener("change", () => {
+        state.civitaiKey = elements.civitaiKey.value.trim();
         saveState();
     });
     elements.attach.addEventListener("click", () => elements.fileInput.click());

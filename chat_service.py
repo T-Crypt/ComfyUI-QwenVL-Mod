@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -29,7 +30,28 @@ MAX_GRAPH_NODES = 200
 MAX_CHAT_IMAGES = 3
 MAX_VIDEO_FRAMES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-ALLOWED_ACTIONS = {"set_widget_value", "set_node_mode", "queue_workflow", "add_node", "remove_node", "connect", "disconnect", "layout"}
+ALLOWED_ACTIONS = {"set_widget_value", "set_node_mode", "queue_workflow", "add_node", "remove_node", "connect", "disconnect", "layout", "search_models", "download_model", "clear_graph"}
+
+# Model-store kinds the download action may write to (folder_paths keys).
+DOWNLOAD_KINDS = {"checkpoint", "lora", "vae", "embedding", "controlnet"}
+KIND_FOLDERS = {
+    "checkpoint": ("checkpoints", (".safetensors", ".ckpt", ".pt", ".bin")),
+    "lora": ("loras", (".safetensors", ".pt", ".bin")),
+    "vae": ("vae", (".safetensors", ".pt", ".bin", ".ckpt")),
+    "embedding": ("embeddings", (".safetensors", ".pt", ".bin")),
+    "controlnet": ("controlnet", (".safetensors", ".pt", ".bin", ".ckpt")),
+}
+
+# civitai.com download URLs redirect to a CDN: the initial host is checked,
+# redirects are followed, the payload lands only in a KIND_FOLDERS dir.
+DOWNLOAD_HOSTS = {"civitai.com", "www.civitai.com", "api.civitai.com"}
+
+# Installed-models context: scanned per chat (cached), capped, so the model
+# picks real filenames instead of hallucinating them.
+MODELS_CONTEXT_FOLDERS = ("checkpoints", "loras", "vae", "embeddings", "controlnet")
+MODELS_CONTEXT_FILES = 60
+MODELS_CONTEXT_TTL_S = 120
+_models_context_cache = {"at": 0.0, "text": ""}
 
 # API backend (llama-swap, OpenAI-compatible). Lets QwenChat's workflow-control
 # protocol run on a served model instead of a locally loaded GGUF/HF weight —
@@ -137,7 +159,7 @@ BASE_SYSTEM_PROMPT = """You are Qwen Workflow Assistant inside ComfyUI. Answer t
 LANGUAGE: "message" and choice labels must mirror the LATEST user message language. Workflow prompt text must be English.
 OUTPUT: return exactly one JSON object, no text outside it:
 {"message":"reply","actions":[{"type":"set_widget_value","node_id":1,"widget":"steps","value":25},{"type":"queue_workflow"}],"choices":[{"label":"A","send":"text for A"}]}
-Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow, add_node, remove_node, connect, disconnect, layout. Never invent numeric node IDs or widget names — nodes you create are referenced by the key you assign them (see 4). Never emit code, shell, filesystem, JS, or network actions.
+Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow, add_node, remove_node, connect, disconnect, layout, search_models, download_model, clear_graph. Never invent numeric node IDs or widget names — nodes you create are referenced by the key you assign them (see 4). Never emit code, shell, filesystem, JS, or network actions.
 When asked to generate/run/queue, apply every required widget update and include queue_workflow in the same response. Never ask "execute now?" after queue_workflow. If you only set a prompt without queue_workflow, do not claim execution started.
 Choices are top-level, only when truly ambiguous. Always close braces.
 ---
@@ -166,7 +188,12 @@ Only write prompts into real generation widgets (prompt/custom_prompt/prompt_tex
    - Add: {"type":"add_node","key":"k1","node_type":"KSampler"} with your own short key; later actions in the SAME response use "k1" and the panel maps it to the real id. Order matters: add first, then set its widgets, then connect it. Omit x/y for auto-place. Only use node types that exist in ComfyUI (types already in the snapshot are safe; standard ones like KSampler, CheckpointLoaderSimple, CLIPTextEncode, VAEDecode, EmptyLatentImage, PreviewImage, LoraLoader are fine). If creation fails the panel reports why — ask the user, don't retry blindly.
    - Wire: {"type":"connect","from":id_or_key,"out":"MODEL","to":id,"in":"model"} using slot names. A target input that is already linked must be freed first: {"type":"disconnect","node_id":id,"input":"model"}.
    - Remove: {"type":"remove_node","node_id":id} — only nodes the user asked to remove; removing a node deletes its links.
-   - Tidy: {"type":"layout"} rearranges the whole graph into neat columns ("organize this workflow"). Report structural results (new ids, links made/broken) in "message"."""
+   - Tidy: {"type":"layout"} rearranges the whole graph into neat columns ("organize this workflow"). Report structural results (new ids, links made/broken) in "message".
+5. Live assistant (multi-round: you act, the panel reports back, you continue):
+   - You may work over several rounds in one response cycle: tool results and rejected actions come back as user messages prefixed OBSERVATION — read them and continue (fix, retry with other values, or finish). Stop when done; never queue twice.
+   - Building from a blank canvas: chain loaders → encoders → sampler → decode → output (e.g. CheckpointLoaderSimple → CLIPTextEncode ×2 → EmptyLatentImage → KSampler → VAEDecode → PreviewImage/SaveImage), set each widget, connect by slot names, layout, then queue. If the checkpoint is uncertain, ask via choices instead of guessing.
+   - Model store: the INSTALLED MODELS block lists real filenames — always prefer them in loader widgets. If the user names something missing, search CivitAI: {"type":"search_models","query":"...","types":"LORA"} and offer the hits as choices (label + send "download <name>: <url>"). Download only what the user picks: {"type":"download_model","url":"...","kind":"lora"} (kind: checkpoint/lora/vae/embedding/controlnet). The file lands in the store and is immediately usable by name.
+   - clear_graph wipes the whole canvas: ONLY when the user explicitly says so ("start over", "clear", "new workflow"). Never as a side effect."""
 
 _LT = chr(60)
 _GT = chr(62)
@@ -300,6 +327,18 @@ def validate_actions(actions):
             result.append({"type": action_type, "from": action["from"], "to": action["to"], "out": action["out"], "in": action["in"]})
         elif action_type == "disconnect" and isinstance(action.get("node_id"), (int, str)) and isinstance(action.get("input"), (str, int)):
             result.append({"type": action_type, "node_id": action["node_id"], "input": action["input"]})
+        elif action_type == "search_models" and isinstance(action.get("query"), str) and 0 < len(action["query"]) <= 300:
+            entry = {"type": action_type, "query": action["query"]}
+            if isinstance(action.get("types"), str) and action["types"]:
+                entry["types"] = action["types"][:200]
+            result.append(entry)
+        elif action_type == "download_model" and isinstance(action.get("url"), str) and 0 < len(action["url"]) <= 2000 and isinstance(action.get("kind"), str) and action.get("kind") in DOWNLOAD_KINDS:
+            entry = {"type": action_type, "url": action["url"], "kind": action["kind"]}
+            if isinstance(action.get("filename"), str) and action["filename"]:
+                entry["filename"] = action["filename"][:200]
+            result.append(entry)
+        elif action_type == "clear_graph":
+            result.append({"type": action_type})
     return result
 
 
@@ -777,15 +816,68 @@ def _chat_guides_for(graph, has_images=False):
     )
 
 
+def _scan_model_files(folder, limit=500):
+    try:
+        import folder_paths
+    except ImportError:
+        return []
+    found = []
+    try:
+        roots = folder_paths.get_folder_paths(folder) or []
+    except Exception:
+        return []
+    for root in roots:
+        base = Path(root)
+        if not base.is_dir():
+            continue
+        try:
+            for dirpath, _dirnames, filenames in os.walk(base):
+                for name in filenames:
+                    if name.lower().endswith((".safetensors", ".ckpt", ".pt", ".bin", ".gguf", ".onnx", ".pth")):
+                        try:
+                            found.append(str(Path(dirpath, name).relative_to(base).as_posix()))
+                        except ValueError:
+                            found.append(name)
+                        if len(found) >= limit:
+                            return sorted(found)
+        except OSError:
+            continue
+    return sorted(found)
+
+
+def installed_models_context():
+    """Compact installed-models block for the prompt (cached). Best-effort:
+    an unreadable store yields an empty block, never an error."""
+    import time as _time
+    now = _time.time()
+    if now - _models_context_cache["at"] < MODELS_CONTEXT_TTL_S:
+        return _models_context_cache["text"]
+    parts = []
+    for folder in MODELS_CONTEXT_FOLDERS:
+        try:
+            files = _scan_model_files(folder)
+        except Exception:
+            files = []
+        shown = files[:MODELS_CONTEXT_FILES]
+        extra = f" (+{len(files) - len(shown)} more)" if len(files) > len(shown) else ""
+        parts.append(f"{folder} ({len(files)}{extra}): " + (", ".join(shown) if shown else "(none)"))
+    text = "\n".join(parts)
+    _models_context_cache.update(at=now, text=text)
+    return text
+
+
 def build_prompt(messages, graph, enable_thinking=False, has_images=False, has_video=False):
     history = "\n".join(f"{item['role'].upper()}: {item['content']}" for item in messages)
     snapshot = json.dumps(graph, ensure_ascii=False, separators=(",", ":"))
     if len(snapshot) > GRAPH_SNAPSHOT_CHARS:
         snapshot = snapshot[:GRAPH_SNAPSHOT_CHARS]
+    models_block = installed_models_context()
     instruction = BASE_SYSTEM_PROMPT + _preset_guides(graph, messages, has_images) + _chat_guides_for(graph, has_images)
     instruction += THINKING_INSTRUCTION if enable_thinking else NO_THINKING_INSTRUCTION
     if has_video:
         instruction += "\nVIDEO INPUT: sampled frames from a video clip are attached to the latest user message. Treat them as the clip itself when the user asks to review, critique, or refine a generated video."
+    if models_block:
+        instruction += "\n\nINSTALLED MODELS — use these exact filenames in checkpoint/LoRA/VAE widgets (paths relative to their folders):\n" + models_block
     return f"{instruction}\n\nWORKFLOW SNAPSHOT:\n{snapshot}\n\nCONVERSATION:\n{history}\n\nJSON RESPONSE:"
 
 
@@ -1205,6 +1297,110 @@ def _api_models():
     """Model list for the API backend. Static default so the dropdown works
     even when llama-swap is down; the configured model is always the default."""
     return [API_DEFAULT_MODEL]
+
+
+CIVITAI_API = "https://api.civitai.com/v1/models"
+
+
+def civitai_search(query, types="", limit=8):
+    """Proxy CivitAI model search (fixed host, capped). Returns compact hits
+    with per-version download URLs the download action accepts."""
+    try:
+        count = max(1, min(int(limit), 20))
+    except (TypeError, ValueError):
+        count = 8
+    params = {"query": query, "limit": count, "nsfw": "true", "sort": "Highest Rated"}
+    if types:
+        params["types"] = types
+    url = CIVITAI_API + "?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, headers={"User-Agent": "QwenChat/1.0"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    items = []
+    for model in (data or {}).get("items") or []:
+        versions = []
+        for version in (model.get("modelVersions") or [])[:3]:
+            files = [f for f in (version.get("files") or []) if f.get("downloadUrl")]
+            if not files:
+                continue
+            first = files[0]
+            versions.append({
+                "id": version.get("id"),
+                "name": version.get("name"),
+                "url": first.get("downloadUrl"),
+                "sizeKB": first.get("sizeKB"),
+                "baseModel": version.get("baseModel"),
+            })
+        if versions:
+            items.append({"name": model.get("name"), "type": model.get("type"), "versions": versions})
+    return items
+
+
+def _content_filename(headers):
+    raw = headers.get("Content-Disposition", "")
+    match = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", raw, re.IGNORECASE)
+    if not match:
+        match = re.search(r'filename\s*=\s*"?([^";]+)"?', raw, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return urllib.parse.unquote(match.group(1).strip())
+    except Exception:
+        return None
+
+
+def download_model(url, kind, filename=None, token=None):
+    """Fetch a model file into the ComfyUI store. Guardrails: initial host
+    allow-list, kind-to-folder allow-map, extension allow-list per kind,
+    sanitized basename, auto-suffix on collision. Token (if any) travels only
+    as an Authorization header and is never logged."""
+    if kind not in DOWNLOAD_KINDS:
+        raise ValueError(f"unknown model kind '{kind}'")
+    folder, exts = KIND_FOLDERS[kind]
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:
+        raise ValueError("unparseable download URL")
+    if host not in DOWNLOAD_HOSTS:
+        raise ValueError(f"downloads only allowed from {sorted(DOWNLOAD_HOSTS)}")
+    try:
+        import folder_paths as _fp
+        roots = _fp.get_folder_paths(folder) or []
+    except Exception:
+        roots = []
+    if not roots:
+        raise ValueError(f"no local folder for model kind '{kind}'")
+    dest_dir = roots[0]
+    headers = {"User-Agent": "QwenChat/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=120)
+    except Exception as error:
+        raise ValueError(f"download request failed: {error}")
+    with response:
+        name = filename or _content_filename(response.headers) or os.path.basename(urllib.parse.urlsplit(url).path)
+        base = (name or "").strip()
+        if not base or base in {".", ".."} or "/" in base or "\\" in base:
+            raise ValueError("could not determine a safe filename (pass one explicitly)")
+        if not base.lower().endswith(exts):
+            raise ValueError(f"'{base}' is not a {kind} file (expected {exts})")
+        target = os.path.join(dest_dir, base)
+        stem, dot, ext = base.rpartition(".")
+        counter = 2
+        while os.path.exists(target):
+            target = os.path.join(dest_dir, f"{stem}-{counter}{dot}{ext}")
+            counter += 1
+        total = 0
+        with open(target, "wb") as handle:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                total += len(chunk)
+    return {"filename": os.path.basename(target), "bytes": total, "kind": kind, "folder": folder}
 
 
 def _api_chat_completions(system, user_text, images_b64, model_name, options):

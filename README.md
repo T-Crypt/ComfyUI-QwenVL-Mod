@@ -30,6 +30,7 @@ Open **Qwen Chat** from the ComfyUI sidebar to talk to a local Qwen model while 
 - Enable **Unload Qwen before running the workflow** to release chat model memory before heavy WAN, LTX, or MiniMax executions.
 - Chat history and preferences are stored only in the browser's local storage and can be cleared with **New chat**.
 - Structural edits apply live to the open graph: add nodes, remove them, connect/disconnect links, and tidy the layout. The Stop button stops waiting in the browser; an inference already running on the backend may continue until generation completes.
+- Live-assistant loop: search CivitAI, download models into the store, build workflows from a blank canvas, and self-correct over several rounds. Put your CivitAI API key in the panel settings (CivitAI key field, this browser only) to enable downloads; the model sees your installed checkpoints/LoRAs and prefers real filenames.
 
 The assistant applies a restricted, validated action protocol: set validated widget values, enable/bypass nodes, queue the workflow — and structural edits (add nodes by key, remove nodes, connect/disconnect links, tidy the graph into columns). Model output that references an unknown node, widget, value, or operation is rejected and reported in the conversation. It never executes arbitrary JavaScript, shell, filesystem, or network operations.
 

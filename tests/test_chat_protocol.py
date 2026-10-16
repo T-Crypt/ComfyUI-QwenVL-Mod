@@ -654,5 +654,59 @@ class ChatProtocolTests(unittest.TestCase):
         self.assertIn("10.00-second mark", result)
         self.assertIn("integrated_multimodal_description:", result)
 
+    def test_accepts_agent_tool_actions(self):
+        actions = validate_actions([
+            {"type": "search_models", "query": "face lora", "types": "LORA"},
+            {"type": "download_model", "url": "https://civitai.com/api/download/models/1", "kind": "lora"},
+            {"type": "clear_graph"},
+        ])
+        self.assertEqual(len(actions), 3)
+        self.assertEqual(actions[0]["query"], "face lora")
+        self.assertEqual(actions[1]["kind"], "lora")
+
+    def test_rejects_agent_tool_misuse(self):
+        self.assertEqual(validate_actions([
+            {"type": "search_models", "query": ""},
+            {"type": "download_model", "url": "https://civitai.com/api/download/models/1", "kind": "spaceship"},
+        ]), [])
+        # Host gating is enforced at download time, not shape time.
+        import chat_service as cs
+        with self.assertRaises(ValueError):
+            cs.download_model("https://evil.example/x.safetensors", "lora")
+
+    def test_civitai_search_shaping(self):
+        import json as _json
+        from unittest import mock
+        import chat_service as cs
+
+        payload = {"items": [{
+            "name": "Face Fix", "type": "LORA",
+            "modelVersions": [
+                {"id": 11, "name": "v1", "baseModel": "SDXL",
+                 "files": [{"downloadUrl": "https://civitai.com/api/download/models/11", "sizeKB": 204800}]},
+                {"id": 12, "name": "broken", "baseModel": "SDXL", "files": []},
+            ],
+        }]}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return _json.dumps(payload).encode()
+
+        with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp()):
+            items = cs.civitai_search("face", "", 8)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["versions"][0]["url"], "https://civitai.com/api/download/models/11")
+        self.assertEqual(len(items[0]["versions"]), 1)
+
+    def test_installed_models_context_never_raises(self):
+        import chat_service as cs
+        cs._models_context_cache.update(at=0.0, text="")
+        text = cs.installed_models_context()
+        self.assertIsInstance(text, str)
+        for folder in cs.MODELS_CONTEXT_FOLDERS:
+            self.assertIn(folder, text)
+
 if __name__ == "__main__":
     unittest.main()
+
