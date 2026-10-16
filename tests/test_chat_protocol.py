@@ -743,6 +743,84 @@ class ChatProtocolTests(unittest.TestCase):
         self.assertEqual(cs._workflow_name(""), "")
         self.assertEqual(cs._workflow_name(None), "")
 
+    @staticmethod
+    def _comfy_router(running_body=b'{"running": []}', stats_body=None, stats_error=False, calls=None):
+        """URL-routing fake for urllib in the _comfy_free tests."""
+        class _Resp:
+            def __init__(self, body=b""):
+                self._body = body
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return self._body
+
+        def route(request, timeout=None):
+            url = getattr(request, "full_url", str(request))
+            if calls is not None:
+                calls.append(url)
+            if url.endswith("/running"):
+                return _Resp(running_body)
+            if url.endswith("/system_stats"):
+                if stats_error:
+                    raise OSError("stats unavailable")
+                return _Resp(stats_body)
+            return _Resp()  # POST /free
+
+        return route
+
+    def test_comfy_free_refuses_occupied_card(self):
+        import chat_service as cs
+        from unittest import mock
+
+        stats = b'{"devices": [{"name": "cuda:0", "vram_free": 5000000000, "vram_total": 25000000000}]}'
+        with mock.patch.object(cs.urllib.request, "urlopen",
+                               side_effect=self._comfy_router(stats_body=stats)), \
+                mock.patch.object(cs, "FREE_WAIT_S", 0.0):
+            with self.assertRaises(ValueError):
+                cs._comfy_free("NInfer-HauHauCS-27B")
+
+    def test_comfy_free_passes_when_card_is_free(self):
+        import chat_service as cs
+        from unittest import mock
+
+        stats = b'{"devices": [{"name": "cuda:0", "vram_free": 23000000000, "vram_total": 25000000000}]}'
+        with mock.patch.object(cs.urllib.request, "urlopen",
+                               side_effect=self._comfy_router(stats_body=stats)), \
+                mock.patch.object(cs, "FREE_WAIT_S", 0.0):
+            cs._comfy_free("NInfer-HauHauCS-27B")
+
+    def test_comfy_free_fails_open_when_stats_unreadable(self):
+        import chat_service as cs
+        from unittest import mock
+
+        with mock.patch.object(cs.urllib.request, "urlopen",
+                               side_effect=self._comfy_router(stats_error=True)), \
+                mock.patch.object(cs, "FREE_WAIT_S", 0.0):
+            cs._comfy_free("NInfer-HauHauCS-27B")  # must not raise
+
+    def test_comfy_free_skips_when_model_already_warm(self):
+        import chat_service as cs
+        from unittest import mock
+
+        warm = b'{"running": [{"model": "NInfer-HauHauCS-27B", "state": "ready"}]}'
+        calls = []
+        with mock.patch.object(cs.urllib.request, "urlopen",
+                               side_effect=self._comfy_router(running_body=warm, calls=calls)):
+            cs._comfy_free("NInfer-HauHauCS-27B")
+        # No /free, no stats: a warm model must not be shoved aside.
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].endswith("/running"))
+
+    def test_comfy_free_allows_llamaswap_swap(self):
+        import chat_service as cs
+        from unittest import mock
+
+        other = b'{"running": [{"model": "agent", "state": "ready"}]}'
+        stats = b'{"devices": [{"name": "cuda:0", "vram_free": 5000000000, "vram_total": 25000000000}]}'
+        with mock.patch.object(cs.urllib.request, "urlopen",
+                               side_effect=self._comfy_router(running_body=other, stats_body=stats)), \
+                mock.patch.object(cs, "FREE_WAIT_S", 0.0):
+            cs._comfy_free("NInfer-HauHauCS-27B")  # llama-swap will swap; no raise
+
 if __name__ == "__main__":
     unittest.main()
 

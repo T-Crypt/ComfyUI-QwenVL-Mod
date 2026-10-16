@@ -76,8 +76,20 @@ API_TIMEOUT_S = int(os.environ.get("QWENCHAT_API_TIMEOUT_S", "600"))
 # chat model before a workflow runs. Without this the load collides with
 # resident weights and llama-swap 500s ("upstream command exited prematurely").
 COMFY_URL = os.environ.get("QWENCHAT_COMFY_URL", "http://127.0.0.1:8188")
+# llama-swap's management API (no /v1 suffix): /running tells us whether the
+# chat model is already up — a warm model occupies the card itself, so the
+# free-VRAM guard must not run against it.
+LLAMA_SWAP_URL = os.environ.get("LLAMA_SWAP_URL", "http://127.0.0.1:9090")
 WAIT_FOR_IDLE = os.environ.get("QWENCHAT_WAIT_FOR_IDLE", "1") == "1"
 QUEUE_POLL_S = float(os.environ.get("QWENCHAT_QUEUE_POLL_S", "5"))
+# /free flags are applied asynchronously by ComfyUI's queue worker, so poll
+# /system_stats after the call: wait up to FREE_WAIT_S for the card to free.
+# The served chat model (NInfer-HauHauCS-27B) fills ~22.6 GiB of the 4090 and
+# the healthy post-/free state leaves ~23 GiB free, so requiring most of the
+# card separates "weights released" from "still resident" by a wide margin.
+FREE_POLL_S = float(os.environ.get("QWENCHAT_FREE_POLL_S", "1.5"))
+FREE_WAIT_S = float(os.environ.get("QWENCHAT_FREE_WAIT_S", "30"))
+FREE_VRAM_MIN_FRACTION = float(os.environ.get("QWENCHAT_MIN_FREE_VRAM_FRACTION", "0.90"))
 MINIMAX_I2VA_BINDING = "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
 
 
@@ -1304,23 +1316,105 @@ def _comfy_queue_busy():
     return bool(data.get("queue_running") or data.get("queue_pending"))
 
 
-def _comfy_free():
-    """Unload ComfyUI models (POST /free never interrupts a running job, so
-    callers wait for idle first). Best-effort: failure only logs."""
+def _comfy_vram_free():
+    """ComfyUI's /system_stats device 0 (vram_free, vram_total) in bytes, or
+    None when that endpoint is unavailable (older servers, IPC hiccup)."""
     try:
-        request = urllib.request.Request(COMFY_URL.rstrip("/") + "/free", data=b"", method="POST")
+        with urllib.request.urlopen(COMFY_URL.rstrip("/") + "/system_stats", timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    devices = (data or {}).get("devices") or []
+    if not devices:
+        return None
+    device = devices[0] or {}
+    free = device.get("vram_free")
+    total = device.get("vram_total")
+    if isinstance(free, (int, float)) and isinstance(total, (int, float)) and total > 0:
+        return float(free), float(total)
+    return None
+
+
+def _llamaswap_running():
+    """Set of model names llama-swap currently holds (any state), or None
+    when it can't be reached or answers an unexpected shape (fail open)."""
+    try:
+        with urllib.request.urlopen(LLAMA_SWAP_URL.rstrip("/") + "/running", timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    models = data.get("running") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return None
+    names = set()
+    for entry in models:
+        if isinstance(entry, dict) and isinstance(entry.get("model"), str):
+            names.add(entry["model"])
+    return names
+
+
+def _comfy_free(model_name=None):
+    """Make room on the shared card for the api chat model.
+
+    Three states, in order:
+    1. The requested model is already up in llama-swap: serve from it — no
+       load happens, so resident VRAM (a warm NInfer alone holds ~22.6 of
+       23.6 GiB) must not block the message.
+    2. Otherwise unload ComfyUI via POST /free {'unload_models','free_memory'}
+       — the route 500s on an empty body, which made the original version a
+       silent no-op — and poll /system_stats until the device frees: the
+       queue worker applies the flags asynchronously. Fail-open when stats
+       are unreadable.
+    3. Still occupied after the wait: other llama-swap models are fine (the
+       broker swaps them out for our request), but with llama-swap empty the
+       memory belongs to something it cannot reclaim (ComfyUI failed to
+       release, or another process) — stop with an actionable error instead
+       of letting the llama-server die on the load ("upstream command exited
+       prematurely")."""
+    running = _llamaswap_running()
+    if running and model_name and model_name in running:
+        return
+    payload = json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8")
+    try:
+        request = urllib.request.Request(
+            COMFY_URL.rstrip("/") + "/free", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(request, timeout=30) as response:
             response.read()
     except Exception as error:
         print(f"[QwenVL Chat] ComfyUI /free failed ({error})")
+        return
+    stats = _comfy_vram_free()
+    if stats is None:
+        return
+    free, total = stats
+    required = total * FREE_VRAM_MIN_FRACTION
+    deadline = time.time() + FREE_WAIT_S
+    while free < required and time.time() < deadline:
+        time.sleep(FREE_POLL_S)
+        stats = _comfy_vram_free()
+        if stats is None:
+            return
+        free, total = stats
+        required = total * FREE_VRAM_MIN_FRACTION
+    if free < required:
+        running = _llamaswap_running()
+        if running is None or running:
+            return
+        raise ValueError(
+            "ComfyUI (or another local process) is still holding most of the GPU "
+            f"({round(free / 1073741824, 1)} GB free of {round(total / 1073741824, 1)} GB; "
+            f"the chat model needs about {round(required / 1073741824, 1)} GB). "
+            "Restart ComfyUI (or use its Free model and node cache menu) and send again."
+        )
 
 
-def _await_comfy_idle():
+def _await_comfy_idle(model_name=None):
     if not WAIT_FOR_IDLE:
         return
     while _comfy_queue_busy():
         time.sleep(QUEUE_POLL_S)
-    _comfy_free()
+    _comfy_free(model_name)
 
 
 def fit_history_to_budget(messages):
@@ -1589,7 +1683,7 @@ class ChatRuntime:
         # resident, and a running one owns the card — wait behind the job,
         # free the weights, then load the chat model into a free card.
         # (Runs under ChatRuntime's lock; the retry path re-checks cheaply.)
-        _await_comfy_idle()
+        _await_comfy_idle(model_name)
         # Reuse the exact prompt the local backends get (system rules +
         # workflow snapshot + conversation) as the user message, with the
         # protocol system prompt as `system` — so workflow control (actions,
