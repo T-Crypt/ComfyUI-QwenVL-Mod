@@ -29,7 +29,7 @@ MAX_GRAPH_NODES = 200
 MAX_CHAT_IMAGES = 3
 MAX_VIDEO_FRAMES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-ALLOWED_ACTIONS = {"set_widget_value", "set_node_mode", "queue_workflow"}
+ALLOWED_ACTIONS = {"set_widget_value", "set_node_mode", "queue_workflow", "add_node", "remove_node", "connect", "disconnect", "layout"}
 
 # API backend (llama-swap, OpenAI-compatible). Lets QwenChat's workflow-control
 # protocol run on a served model instead of a locally loaded GGUF/HF weight —
@@ -137,7 +137,7 @@ BASE_SYSTEM_PROMPT = """You are Qwen Workflow Assistant inside ComfyUI. Answer t
 LANGUAGE: "message" and choice labels must mirror the LATEST user message language. Workflow prompt text must be English.
 OUTPUT: return exactly one JSON object, no text outside it:
 {"message":"reply","actions":[{"type":"set_widget_value","node_id":1,"widget":"steps","value":25},{"type":"queue_workflow"}],"choices":[{"label":"A","send":"text for A"}]}
-Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow. Never invent node IDs or widget names. Never emit code, shell, filesystem, JS, or connection actions.
+Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow, add_node, remove_node, connect, disconnect, layout. Never invent numeric node IDs or widget names — nodes you create are referenced by the key you assign them (see 4). Never emit code, shell, filesystem, JS, or network actions.
 When asked to generate/run/queue, apply every required widget update and include queue_workflow in the same response. Never ask "execute now?" after queue_workflow. If you only set a prompt without queue_workflow, do not claim execution started.
 Choices are top-level, only when truly ambiguous. Always close braces.
 ---
@@ -161,7 +161,12 @@ WORKFLOW TARGETS (pick the FIRST matching case for the node you are controlling)
 2. Passthrough node (has passthrough but NO image pixels): write the complete final English prompt into the actual prompt widget and set passthrough=true.
 3. Direct prompt: write the complete final English prompt into the generation widget. Use attached images as context when present.
 When you set a text/prompt widget, repeat the new value verbatim in "message" so the user sees it.
-Only write prompts into real generation widgets (prompt/custom_prompt/prompt_text). NEVER write into display nodes like ShowText, easy showAnything, or MarkdownNote."""
+Only write prompts into real generation widgets (prompt/custom_prompt/prompt_text). NEVER write into display nodes like ShowText, easy showAnything, or MarkdownNote.
+4. Structural edits (live graph surgery — the snapshot now carries inputs, outputs, links and positions):
+   - Add: {"type":"add_node","key":"k1","node_type":"KSampler"} with your own short key; later actions in the SAME response use "k1" and the panel maps it to the real id. Order matters: add first, then set its widgets, then connect it. Omit x/y for auto-place. Only use node types that exist in ComfyUI (types already in the snapshot are safe; standard ones like KSampler, CheckpointLoaderSimple, CLIPTextEncode, VAEDecode, EmptyLatentImage, PreviewImage, LoraLoader are fine). If creation fails the panel reports why — ask the user, don't retry blindly.
+   - Wire: {"type":"connect","from":id_or_key,"out":"MODEL","to":id,"in":"model"} using slot names. A target input that is already linked must be freed first: {"type":"disconnect","node_id":id,"input":"model"}.
+   - Remove: {"type":"remove_node","node_id":id} — only nodes the user asked to remove; removing a node deletes its links.
+   - Tidy: {"type":"layout"} rearranges the whole graph into neat columns ("organize this workflow"). Report structural results (new ids, links made/broken) in "message"."""
 
 _LT = chr(60)
 _GT = chr(62)
@@ -228,11 +233,26 @@ def validate_graph(graph):
         for inp in node.get("inputs", []):
             if not isinstance(inp, dict) or not isinstance(inp.get("name"), str):
                 continue
+            link = inp.get("link")
             safe_inputs.append({
                 "name": inp["name"][:200],
                 "type": str(inp.get("type", ""))[:100],
-                "link": inp.get("link"),
+                "link": link if isinstance(link, (int, type(None))) else None,
             })
+        safe_outputs = []
+        for out in node.get("outputs", []):
+            if not isinstance(out, dict) or not isinstance(out.get("name"), str):
+                continue
+            links = out.get("links")
+            safe_outputs.append({
+                "name": out["name"][:200],
+                "type": str(out.get("type", ""))[:100],
+                "links": [link for link in links[:20] if isinstance(link, int)] if isinstance(links, list) else [],
+            })
+        pos = node.get("pos", [0, 0])
+        safe_pos = [0, 0]
+        if isinstance(pos, (list, tuple)) and len(pos) >= 2 and isinstance(pos[0], (int, float)) and isinstance(pos[1], (int, float)):
+            safe_pos = [pos[0], pos[1]]
         result.append({
             "id": node["id"],
             "type": str(node.get("type", ""))[:200],
@@ -240,6 +260,8 @@ def validate_graph(graph):
             "mode": node.get("mode", 0),
             "widgets": safe_widgets,
             "inputs": safe_inputs,
+            "outputs": safe_outputs,
+            "pos": safe_pos,
         })
     return {"nodes": result}
 
@@ -254,6 +276,8 @@ def validate_actions(actions):
         action_type = action["type"]
         if action_type == "queue_workflow":
             result.append({"type": action_type})
+        elif action_type == "layout":
+            result.append({"type": action_type})
         elif action_type == "set_node_mode" and isinstance(action.get("node_id"), (int, str)) and action.get("mode") in {"bypass", "enable"}:
             result.append({"type": action_type, "node_id": action["node_id"], "mode": action["mode"]})
         elif action_type == "set_widget_value" and isinstance(action.get("node_id"), (int, str)) and isinstance(action.get("widget"), str) and len(action["widget"]) <= 200:
@@ -262,6 +286,20 @@ def validate_actions(actions):
                 if isinstance(value, str):
                     value = _expand_wildcard_tokens(value)
                 result.append({"type": action_type, "node_id": action["node_id"], "widget": action["widget"], "value": value})
+        elif action_type == "add_node" and isinstance(action.get("key"), str) and 0 < len(action["key"]) <= 80 and isinstance(action.get("node_type"), str) and 0 < len(action["node_type"]) <= 200:
+            entry = {"type": action_type, "key": action["key"], "node_type": action["node_type"]}
+            if isinstance(action.get("title"), str) and action["title"]:
+                entry["title"] = action["title"][:200]
+            for axis in ("x", "y"):
+                if isinstance(action.get(axis), (int, float)):
+                    entry[axis] = action[axis]
+            result.append(entry)
+        elif action_type == "remove_node" and isinstance(action.get("node_id"), (int, str)):
+            result.append({"type": action_type, "node_id": action["node_id"]})
+        elif action_type == "connect" and isinstance(action.get("from"), (int, str)) and isinstance(action.get("to"), (int, str)) and isinstance(action.get("out"), (str, int)) and isinstance(action.get("in"), (str, int)):
+            result.append({"type": action_type, "from": action["from"], "to": action["to"], "out": action["out"], "in": action["in"]})
+        elif action_type == "disconnect" and isinstance(action.get("node_id"), (int, str)) and isinstance(action.get("input"), (str, int)):
+            result.append({"type": action_type, "node_id": action["node_id"], "input": action["input"]})
     return result
 
 

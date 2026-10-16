@@ -29,9 +29,9 @@ Open **Qwen Chat** from the ComfyUI sidebar to talk to a local Qwen model while 
 - Ask for changes such as `Set the KSampler to 25 steps and queue the workflow`.
 - Enable **Unload Qwen before running the workflow** to release chat model memory before heavy WAN, LTX, or MiniMax executions.
 - Chat history and preferences are stored only in the browser's local storage and can be cleared with **New chat**.
-- The first version cannot add, connect, or delete nodes and never executes arbitrary JavaScript, shell, filesystem, or network operations.
+- Structural edits apply live to the open graph: add nodes, remove them, connect/disconnect links, and tidy the layout. The Stop button stops waiting in the browser; an inference already running on the backend may continue until generation completes.
 
-The assistant applies only a restricted, validated action protocol. Model output that references an unknown node, widget, value, or operation is rejected and reported in the conversation. The Stop button stops waiting in the browser; an inference already running on the backend may continue until generation completes.
+The assistant applies a restricted, validated action protocol: set validated widget values, enable/bypass nodes, queue the workflow — and structural edits (add nodes by key, remove nodes, connect/disconnect links, tidy the graph into columns). Model output that references an unknown node, widget, value, or operation is rejected and reported in the conversation. It never executes arbitrary JavaScript, shell, filesystem, or network operations.
 
 <img width="690" height="652" alt="qwen-chat-1" src="https://github.com/user-attachments/assets/4456833b-4c8d-4484-b141-7e2eaa9ba255" /> <img width="710" height="900" alt="qwen-chat-2" src="https://github.com/user-attachments/assets/14e825a5-8c0c-48fb-9417-0c6e7cf7841f" />
 

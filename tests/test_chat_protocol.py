@@ -81,6 +81,47 @@ class ChatProtocolTests(unittest.TestCase):
         self.assertEqual(thinking, "because reasons")
         self.assertIn('"message"', rest)
 
+    def test_accepts_structural_actions(self):
+        actions = validate_actions([
+            {"type": "add_node", "key": "k1", "node_type": "KSampler", "title": "Hi", "x": 10, "y": 20.5},
+            {"type": "remove_node", "node_id": 3},
+            {"type": "connect", "from": "k1", "out": "LATENT", "to": 2, "in": 0},
+            {"type": "disconnect", "node_id": 2, "input": "model"},
+            {"type": "layout"},
+        ])
+        self.assertEqual(len(actions), 5)
+        self.assertEqual(actions[0]["key"], "k1")
+        self.assertEqual(actions[0]["x"], 10)
+        self.assertEqual(actions[2]["from"], "k1")
+
+    def test_rejects_malformed_structural_actions(self):
+        self.assertEqual(validate_actions([
+            {"type": "add_node", "key": "", "node_type": "KSampler"},
+            {"type": "add_node", "node_type": "KSampler"},
+            {"type": "connect", "from": 1, "to": 2},
+            {"type": "disconnect", "node_id": 2},
+            {"type": "teleport"},
+        ]), [])
+
+    def test_validates_graph_links_and_pos(self):
+        graph = {"nodes": [{
+            "id": 1, "type": "KSampler", "title": "K", "mode": 0, "widgets": [],
+            "inputs": [{"name": "model", "type": "MODEL", "link": 7}, {"name": "bad"}],
+            "outputs": [{"name": "LATENT", "type": "LATENT", "links": [9, "x"]}],
+            "pos": [100, 200],
+        }, {
+            "id": 2, "type": "X", "title": "X", "mode": 0, "widgets": [],
+            "pos": "elsewhere",
+        }]}
+        result = validate_graph(graph)
+        self.assertEqual(result["nodes"][0]["inputs"][0]["link"], 7)
+        self.assertEqual(len(result["nodes"][0]["inputs"]), 2)
+        self.assertEqual(result["nodes"][0]["inputs"][1], {"name": "bad", "type": "", "link": None})
+        self.assertEqual(result["nodes"][0]["outputs"][0]["links"], [9])
+        self.assertEqual(result["nodes"][0]["pos"], [100, 200])
+        self.assertEqual(result["nodes"][1]["pos"], [0, 0])
+        self.assertEqual(result["nodes"][1].get("outputs"), [])
+
     def test_validates_graph_snapshot(self):
         graph = {"nodes": [{"id": 1, "type": "KSampler", "title": "Sampler", "mode": 0, "widgets": [{"name": "steps", "value": 20}]}]}
         result = validate_graph(graph)

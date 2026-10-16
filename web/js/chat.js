@@ -244,6 +244,17 @@ function serializeGraphNode(node, prefix) {
                 values: Array.isArray(widget.options.values) ? widget.options.values.slice(0, 200).map(serializeValue) : undefined,
             } : undefined,
         })),
+        inputs: (node.inputs || []).filter((input) => input?.name).map((input) => ({
+            name: input.name,
+            type: input.type || "",
+            link: typeof input.link === "number" ? input.link : null,
+        })),
+        outputs: (node.outputs || []).filter((output) => output?.name).map((output) => ({
+            name: output.name,
+            type: output.type || "",
+            links: Array.isArray(output.links) ? output.links.filter((link) => typeof link === "number").slice(0, 20) : [],
+        })),
+        pos: Array.isArray(node.pos) ? [node.pos[0] || 0, node.pos[1] || 0] : [0, 0],
     }];
     for (const inner of (node.subgraph?._nodes || []).slice(0, 200)) {
         result.push(...serializeGraphNode(inner, String(id)));
@@ -595,43 +606,198 @@ function normalizeWidgetValue(widget, value) {
     return value ?? "";
 }
 
+function liteGraph() {
+    return window.LiteGraph || null;
+}
+
+function resolveSlotIndex(node, side, slot) {
+    const list = side === "output" ? (node.outputs || []) : (node.inputs || []);
+    if (typeof slot === "number") return (slot >= 0 && slot < list.length) ? slot : -1;
+    return list.findIndex((item) => item && item.name === slot);
+}
+
+function slotsCompatible(outType, inType) {
+    const a = String(outType ?? "*").toUpperCase();
+    const b = String(inType ?? "*").toUpperCase();
+    return a === b || a === "*" || b === "*" || a === "ANY" || b === "ANY";
+}
+
+function autoPlaceNode() {
+    const nodes = app.graph?._nodes || [];
+    let maxBottom = 40;
+    for (const node of nodes) {
+        try {
+            const pos = Array.isArray(node.pos) ? node.pos : [0, 0];
+            const size = node.size || [200, 100];
+            maxBottom = Math.max(maxBottom, (pos[1] || 0) + (size[1] || 100));
+        } catch { /* ignore unreadable nodes */ }
+    }
+    return [80 + ((nodes.length * 53) % 360), maxBottom + 60];
+}
+
+function layoutGraph() {
+    // Deterministic tidy: columns by link depth (sources left, sinks right),
+    // rows stacked within a column. Positions only — nothing else changes.
+    const nodes = app.graph?._nodes || [];
+    const byId = new Map(nodes.map((node) => [String(node.id), node]));
+    const depth = new Map();
+    const visiting = new Set();
+    const computeDepth = (node) => {
+        const key = String(node.id);
+        if (depth.has(key)) return depth.get(key);
+        if (visiting.has(key)) return 0;
+        visiting.add(key);
+        let deep = 0;
+        for (const input of node.inputs || []) {
+            if (input?.link == null) continue;
+            const link = app.graph?.links?.[input.link] || app.graph?.getLink?.(input.link);
+            const origin = link && byId.get(String(link.origin_id ?? link.originId));
+            if (origin) deep = Math.max(deep, computeDepth(origin) + 1);
+        }
+        visiting.delete(key);
+        depth.set(key, deep);
+        return deep;
+    };
+    for (const node of nodes) computeDepth(node);
+    const columns = new Map();
+    for (const node of nodes) {
+        const deep = depth.get(String(node.id)) || 0;
+        if (!columns.has(deep)) columns.set(deep, []);
+        columns.get(deep).push(node);
+    }
+    const colWidth = 340;
+    const rowHeight = 260;
+    let moved = 0;
+    for (const [deep, column] of [...columns.entries()].sort((a, b) => a[0] - b[0])) {
+        column.forEach((node, row) => {
+            const x = 80 + deep * colWidth;
+            const y = 80 + row * rowHeight;
+            try {
+                if (Array.isArray(node.pos)) { node.pos[0] = x; node.pos[1] = y; }
+                else node.pos = [x, y];
+                node.setDirtyCanvas?.(true, true);
+                moved++;
+            } catch { /* keep old position */ }
+        });
+    }
+    return moved;
+}
+
 async function applyActions(actions) {
     const applied = [];
     const rejected = [];
     let shouldQueue = false;
+    const keyToId = new Map();
+    const resolveNode = (ref) => {
+        const mapped = keyToId.get(String(ref));
+        return findNode(mapped !== undefined ? mapped : ref);
+    };
     for (const action of Array.isArray(actions) ? actions : []) {
         if (action.type === "queue_workflow") {
             shouldQueue = true;
             continue;
         }
-        const node = findNode(action.node_id);
-        if (!node) {
-            rejected.push(t("missingNode", { node: action.node_id }));
+        if (action.type === "layout") {
+            try {
+                const moved = layoutGraph();
+                applied.push(`organized ${moved} node(s) into columns`);
+            } catch (error) {
+                rejected.push(error.message || String(error));
+            }
             continue;
         }
-        if (action.type === "set_widget_value") {
-            const widget = (node.widgets || []).find((item) => item.name === action.widget);
-            if (!widget) {
-                rejected.push(t("missingWidget", { widget: action.widget, node: action.node_id }));
-                continue;
-            }
-            try {
-                const value = normalizeWidgetValue(widget, action.value);
-                const previousValue = widget.value;
-                widget.value = value;
-                widget.callback?.(value, app.canvas, node);
-                node.onWidgetChanged?.(widget.name, value, previousValue, widget);
+        try {
+            if (action.type === "add_node") {
+                const LG = liteGraph();
+                if (!LG || typeof LG.createNode !== "function") throw new Error("structural edit unavailable: LiteGraph API not found");
+                if (keyToId.has(String(action.key))) throw new Error(`key ${action.key} is already used in this response`);
+                if (!LG.registered_node_types || !LG.registered_node_types[action.node_type]) throw new Error(`unknown node type ${action.node_type}`);
+                const node = LG.createNode(action.node_type);
+                if (!node) throw new Error(`could not create ${action.node_type}`);
+                if (typeof action.title === "string" && action.title) {
+                    try { node.title = action.title; } catch { /* keep default title */ }
+                }
+                const [px, py] = (typeof action.x === "number" && typeof action.y === "number")
+                    ? [action.x, action.y] : autoPlaceNode();
+                try {
+                    if (Array.isArray(node.pos)) { node.pos[0] = px; node.pos[1] = py; }
+                    else node.pos = [px, py];
+                } catch { /* keep default position */ }
+                app.graph.add(node);
+                keyToId.set(String(action.key), node.id);
+                applied.push(`node ${node.id}: added ${action.node_type} as ${action.key}`);
+            } else if (action.type === "remove_node") {
+                const node = resolveNode(action.node_id);
+                if (!node) throw new Error(t("missingNode", { node: action.node_id }));
+                const realId = node.id;
+                app.graph.remove(node);
+                for (const [key, value] of keyToId) {
+                    if (String(value) === String(realId) || key === String(action.node_id)) keyToId.delete(key);
+                }
+                applied.push(`node ${realId}: removed`);
+            } else if (action.type === "connect") {
+                const fromNode = resolveNode(action.from);
+                const toNode = resolveNode(action.to);
+                if (!fromNode) throw new Error(t("missingNode", { node: action.from }));
+                if (!toNode) throw new Error(t("missingNode", { node: action.to }));
+                const outIndex = resolveSlotIndex(fromNode, "output", action.out);
+                const inIndex = resolveSlotIndex(toNode, "input", action.in);
+                if (outIndex < 0) throw new Error(`output ${action.out} does not exist on node ${action.from}`);
+                if (inIndex < 0) throw new Error(`input ${action.in} does not exist on node ${action.to}`);
+                const target = (toNode.inputs || [])[inIndex];
+                if (target && target.link != null) throw new Error(`input ${action.in} on node ${action.to} is already connected — disconnect it first`);
+                const outType = (fromNode.outputs || [])[outIndex]?.type;
+                if (!slotsCompatible(outType, target?.type)) throw new Error(`type mismatch: ${outType} cannot feed ${target?.type}`);
+                fromNode.connect(outIndex, toNode, inIndex);
+                applied.push(`linked ${action.from}:${action.out} → ${action.to}:${action.in}`);
+            } else if (action.type === "disconnect") {
+                const node = resolveNode(action.node_id);
+                if (!node) throw new Error(t("missingNode", { node: action.node_id }));
+                const inIndex = resolveSlotIndex(node, "input", action.input);
+                if (inIndex < 0) throw new Error(`input ${action.input} does not exist on node ${action.node_id}`);
+                const target = (node.inputs || [])[inIndex];
+                if (!target || target.link == null) {
+                    applied.push(`node ${action.node_id}: input ${action.input} already empty`);
+                } else {
+                    node.disconnectInput(inIndex);
+                    applied.push(`node ${action.node_id}: disconnected input ${action.input}`);
+                }
+            } else if (action.type === "set_widget_value") {
+                const node = resolveNode(action.node_id);
+                if (!node) {
+                    rejected.push(t("missingNode", { node: action.node_id }));
+                    continue;
+                }
+                const widget = (node.widgets || []).find((item) => item.name === action.widget);
+                if (!widget) {
+                    rejected.push(t("missingWidget", { widget: action.widget, node: action.node_id }));
+                    continue;
+                }
+                try {
+                    const value = normalizeWidgetValue(widget, action.value);
+                    const previousValue = widget.value;
+                    widget.value = value;
+                    widget.callback?.(value, app.canvas, node);
+                    node.onWidgetChanged?.(widget.name, value, previousValue, widget);
+                    node.setDirtyCanvas?.(true, true);
+                    applied.push(t("nodeValue", { node: action.node_id, widget: widget.name, value: String(value).slice(0, 120) }));
+                } catch (error) {
+                    rejected.push(error.message);
+                }
+            } else if (action.type === "set_node_mode" && ["bypass", "enable"].includes(action.mode)) {
+                const node = resolveNode(action.node_id);
+                if (!node) {
+                    rejected.push(t("missingNode", { node: action.node_id }));
+                    continue;
+                }
+                node.mode = action.mode === "bypass" ? 4 : 0;
                 node.setDirtyCanvas?.(true, true);
-                applied.push(t("nodeValue", { node: action.node_id, widget: widget.name, value: String(value).slice(0, 120) }));
-            } catch (error) {
-                rejected.push(error.message);
+                applied.push(t("nodeMode", { node: action.node_id, mode: action.mode }));
+            } else {
+                rejected.push(t("unsupportedAction", { action: action.type || t("unknown") }));
             }
-        } else if (action.type === "set_node_mode" && ["bypass", "enable"].includes(action.mode)) {
-            node.mode = action.mode === "bypass" ? 4 : 0;
-            node.setDirtyCanvas?.(true, true);
-            applied.push(t("nodeMode", { node: action.node_id, mode: action.mode }));
-        } else {
-            rejected.push(t("unsupportedAction", { action: action.type || t("unknown") }));
+        } catch (error) {
+            rejected.push(error.message || String(error));
         }
     }
     app.graph?.setDirtyCanvas?.(true, true);
