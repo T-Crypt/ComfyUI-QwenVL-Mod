@@ -821,6 +821,55 @@ class ChatProtocolTests(unittest.TestCase):
                 mock.patch.object(cs, "FREE_WAIT_S", 0.0):
             cs._comfy_free("NInfer-HauHauCS-27B")  # llama-swap will swap; no raise
 
+    def _runtime_with_scripted_api(self, responses):
+        """ChatRuntime whose API backend returns scripted replies."""
+        runtime = ChatRuntime()
+        runtime.models = lambda: {"api": ["NInfer-HauHauCS-27B"], "hf": [], "gguf": []}
+        calls = []
+
+        def fake_generate(backend, model_name, prompt, options, enable_thinking, images, video):
+            calls.append((backend, model_name, enable_thinking))
+            return responses.pop(0)
+
+        runtime._generate = fake_generate
+        return runtime, calls
+
+    def test_chat_parses_on_first_attempt(self):
+        runtime, calls = self._runtime_with_scripted_api([
+            '{"message":"steps set","actions":[{"type":"set_widget_value","node_id":1,"widget":"steps","value":20}],"choices":[]}',
+        ])
+        result = runtime.chat("api", "NInfer-HauHauCS-27B",
+                              [{"role": "user", "content": "set 20 steps"}], {"nodes": []}, {})
+        self.assertTrue(result["parsed"])
+        self.assertEqual(result["message"], "steps set")
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["widget"], "steps")
+        self.assertEqual(len(calls), 1)
+
+    def test_chat_retries_until_model_emits_json(self):
+        runtime, calls = self._runtime_with_scripted_api([
+            "We need answer user's request: set steps. Need inspect snapshot and identify errors.",
+            "Still no JSON here, just analysis of the four branches.",
+            '{"message":"ok","actions":[{"type":"set_widget_value","node_id":1,"widget":"steps","value":20}],"choices":[]}',
+        ])
+        result = runtime.chat("api", "NInfer-HauHauCS-27B",
+                              [{"role": "user", "content": "fix the workflow"}], {"nodes": []}, {})
+        self.assertTrue(result["parsed"])
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(len(calls), 3)
+
+    def test_chat_exhausts_json_attempts_returns_no_actions(self):
+        runtime, calls = self._runtime_with_scripted_api([
+            "Rambling one.",
+            "Rambling two.",
+            "Rambling three.",
+        ])
+        result = runtime.chat("api", "NInfer-HauHauCS-27B",
+                              [{"role": "user", "content": "fix the workflow"}], {"nodes": []}, {})
+        self.assertFalse(result["parsed"])
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(len(calls), 3)
+
 if __name__ == "__main__":
     unittest.main()
 

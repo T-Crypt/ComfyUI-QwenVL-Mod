@@ -178,6 +178,7 @@ OUTPUT: return exactly one JSON object, no text outside it:
 {"message":"reply","actions":[{"type":"set_widget_value","node_id":1,"widget":"steps","value":25},{"type":"queue_workflow"}],"choices":[{"label":"A","send":"text for A"}]}
 Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow, add_node, remove_node, connect, disconnect, layout, search_models, download_model, clear_graph, queue_status, queue_cancel, workflow_list, workflow_save, workflow_load, workflow_delete. Never invent numeric node IDs or widget names — nodes you create are referenced by the key you assign them (see 4). Never emit code, shell, filesystem, JS, or network actions.
 When asked to generate/run/queue, apply every required widget update and include queue_workflow in the same response. Never ask "execute now?" after queue_workflow. If you only set a prompt without queue_workflow, do not claim execution started.
+When asked to fix or resolve errors in the workflow, emit the correcting actions (set_widget_value, connect, disconnect, ...) and include queue_workflow when the user wants it run — describing the errors is not enough.
 Choices are top-level, only when truly ambiguous. Always close braces.
 ---
 WORKFLOW TARGETS (pick the FIRST matching case for the node you are controlling):
@@ -1649,27 +1650,31 @@ class ChatRuntime:
         prompt = build_prompt(messages, graph, enable_thinking, bool(images), bool(video))
         with self._lock:
             text = self._generate(backend, model_name, prompt, options, enable_thinking, images, video)
+        MAX_JSON_ATTEMPTS = 3
         result = parse_model_response(text)
-        if result.pop("parsed"):
-            result = enforce_image_enhancer_routing(result, graph, messages, bool(images))
-            result = _fix_minimax_preset_actions(result, graph)
-            return enforce_image_reference_bindings(result, graph, bool(images))
-        # The model ignored the JSON protocol (e.g. a conversational preamble
-        # like "Generating the prompt…" and then stopped). Retry once, echoing
-        # the bad reply back with a strict reminder.
-        retry_messages = messages + [
-            {"role": "assistant", "content": (text or "")[:2000]},
-            {"role": "user", "content": "Your reply was not a JSON object. Return ONLY the JSON object described in the system instructions — no preamble, no extra text."},
-        ]
-        retry_prompt = build_prompt(retry_messages, graph, enable_thinking, bool(images), bool(video))
-        with self._lock:
-            retry_text = self._generate(backend, model_name, retry_prompt, options, enable_thinking, images, video)
-        retry_result = parse_model_response(retry_text)
-        if retry_result.pop("parsed"):
-            retry_result = enforce_image_enhancer_routing(retry_result, graph, messages, bool(images))
-            retry_result = _fix_minimax_preset_actions(retry_result, graph)
-            return enforce_image_reference_bindings(retry_result, graph, bool(images))
-        return result
+        attempts = 1
+        while not result.get("parsed") and attempts < MAX_JSON_ATTEMPTS:
+            attempts += 1
+            if attempts == 2:
+                reminder = ("Return ONLY the JSON object described in the system instructions — "
+                            "no preamble, no extra text, no markdown fences.")
+            else:
+                reminder = ("Your previous replies were not JSON objects. Return exactly one JSON object: "
+                            "{\"message\":\"...\",\"actions\":[...],\"choices\":[]}. No prose, no reasoning tags.")
+            retry_messages = messages + [
+                {"role": "assistant", "content": (text or "")[:2000]},
+                {"role": "user", "content": "Your reply was not a JSON object and applied no workflow changes. " + reminder},
+            ]
+            retry_prompt = build_prompt(retry_messages, graph, enable_thinking, bool(images), bool(video))
+            with self._lock:
+                retry_text = self._generate(backend, model_name, retry_prompt, options, enable_thinking, images, video)
+            text = retry_text
+            result = parse_model_response(text)
+        # Keep "parsed" in the payload so the frontend can tell whether the
+        # model actually returned workflow actions (and retry if it didn't).
+        result = enforce_image_enhancer_routing(result, graph, messages, bool(images))
+        result = _fix_minimax_preset_actions(result, graph)
+        return enforce_image_reference_bindings(result, graph, bool(images))
 
     def _generate(self, backend, model_name, prompt, options, enable_thinking, images, video=None):
         if backend == "hf":

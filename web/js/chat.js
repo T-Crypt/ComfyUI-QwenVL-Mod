@@ -1114,13 +1114,14 @@ async function sendMessage() {
             data = await response.json();
             if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
             result = await applyActions(data.actions);
-            const hadActions = Array.isArray(data.actions) && data.actions.length > 0;
-            const wantMore = !result.queued && hadActions
-                && (result.observations.length > 0 ? round < MAX_ROUNDS - 1 : result.rejected.length > 0 && round < 1);
+            const parsed = data.parsed === true;
+            const wantMore = !result.queued && round < MAX_ROUNDS - 1
+                && (result.observations.length > 0 || !parsed || (result.rejected.length > 0 && round < 1));
             if (!wantMore) break;
             state.messages.push({ role: "assistant", content: formatAnswer(data.message, result.applied, result.rejected), thinking: data.thinking || "", choices: [] });
             const feedback = result.observations
                 .concat(result.rejected.map((item) => `REJECTED: ${item}`))
+                .concat(!parsed ? ["Your previous reply was not a JSON object and applied no changes. Return ONLY the JSON object: {\"message\":\"...\",\"actions\":[...],\"choices\":[]}. No preamble, no extra text."] : [])
                 .join("\n").slice(0, 6000);
             state.messages.push({ role: "user", content: `OBSERVATION — previous-round results, continue the task:\n${feedback}` });
             state.messages = state.messages.slice(-20);
