@@ -30,7 +30,12 @@ MAX_GRAPH_NODES = 200
 MAX_CHAT_IMAGES = 3
 MAX_VIDEO_FRAMES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-ALLOWED_ACTIONS = {"set_widget_value", "set_node_mode", "queue_workflow", "add_node", "remove_node", "connect", "disconnect", "layout", "search_models", "download_model", "clear_graph"}
+ALLOWED_ACTIONS = {"set_widget_value", "set_node_mode", "queue_workflow", "add_node", "remove_node", "connect", "disconnect", "layout", "search_models", "download_model", "clear_graph", "queue_status", "queue_cancel", "workflow_list", "workflow_save", "workflow_load", "workflow_delete"}
+
+# Workflow-library names: the panel appends ".json" in the userdata workflows
+# dir, so a name must stay a plain filename — no separators, no escapes.
+WORKFLOW_NAME_CHARS = set("/\\:*?\"<>|%")
+WORKFLOW_NAME_MAX = 100
 
 # Model-store kinds the download action may write to (folder_paths keys).
 DOWNLOAD_KINDS = {"checkpoint", "lora", "vae", "embedding", "controlnet"}
@@ -159,7 +164,7 @@ BASE_SYSTEM_PROMPT = """You are Qwen Workflow Assistant inside ComfyUI. Answer t
 LANGUAGE: "message" and choice labels must mirror the LATEST user message language. Workflow prompt text must be English.
 OUTPUT: return exactly one JSON object, no text outside it:
 {"message":"reply","actions":[{"type":"set_widget_value","node_id":1,"widget":"steps","value":25},{"type":"queue_workflow"}],"choices":[{"label":"A","send":"text for A"}]}
-Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow, add_node, remove_node, connect, disconnect, layout, search_models, download_model, clear_graph. Never invent numeric node IDs or widget names — nodes you create are referenced by the key you assign them (see 4). Never emit code, shell, filesystem, JS, or network actions.
+Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow, add_node, remove_node, connect, disconnect, layout, search_models, download_model, clear_graph, queue_status, queue_cancel, workflow_list, workflow_save, workflow_load, workflow_delete. Never invent numeric node IDs or widget names — nodes you create are referenced by the key you assign them (see 4). Never emit code, shell, filesystem, JS, or network actions.
 When asked to generate/run/queue, apply every required widget update and include queue_workflow in the same response. Never ask "execute now?" after queue_workflow. If you only set a prompt without queue_workflow, do not claim execution started.
 Choices are top-level, only when truly ambiguous. Always close braces.
 ---
@@ -193,7 +198,9 @@ Only write prompts into real generation widgets (prompt/custom_prompt/prompt_tex
    - You may work over several rounds in one response cycle: tool results and rejected actions come back as user messages prefixed OBSERVATION — read them and continue (fix, retry with other values, or finish). Stop when done; never queue twice.
    - Building from a blank canvas: chain loaders → encoders → sampler → decode → output (e.g. CheckpointLoaderSimple → CLIPTextEncode ×2 → EmptyLatentImage → KSampler → VAEDecode → PreviewImage/SaveImage), set each widget, connect by slot names, layout, then queue. If the checkpoint is uncertain, ask via choices instead of guessing.
    - Model store: the INSTALLED MODELS block lists real filenames — always prefer them in loader widgets. If the user names something missing, search CivitAI: {"type":"search_models","query":"...","types":"LORA"} and offer the hits as choices (label + send "download <name>: <url>"). Download only what the user picks: {"type":"download_model","url":"...","kind":"lora"} (kind: checkpoint/lora/vae/embedding/controlnet). The file lands in the store and is immediately usable by name.
-   - clear_graph wipes the whole canvas: ONLY when the user explicitly says so ("start over", "clear", "new workflow"). Never as a side effect."""
+   - clear_graph wipes the whole canvas: ONLY when the user explicitly says so ("start over", "clear", "new workflow"). Never as a side effect.
+   - Queue control: {"type":"queue_status"} reports what is running/pending; {"type":"queue_cancel","scope":"running"|"pending"|"all"} stops work (add "prompt_id":"..." with scope pending to cancel one specific job). Cancel only when the user asks to stop something.
+   - Workflow library (the saved workflows in the sidebar): {"type":"workflow_list"} lists saved names; {"type":"workflow_save","name":"..."} saves the open graph under that name — it never overwrites (a collision becomes name-2, name-3, ...; ".json" optional); {"type":"workflow_load","name":"..."} opens a saved workflow and REPLACES the canvas — use it when the user asks; if their canvas looks unfinished you may warn them first, and any further actions in the same response run on the loaded graph; {"type":"workflow_delete","name":"..."} permanently removes a saved workflow — ONLY when the user explicitly asks to delete that specific one."""
 
 _LT = chr(60)
 _GT = chr(62)
@@ -293,6 +300,24 @@ def validate_graph(graph):
     return {"nodes": result}
 
 
+def _workflow_name(value):
+    """Normalize a workflow-library name from the model: strip whitespace,
+    drop a trailing .json, reject separators/controls/.. . Returns '' when
+    unusable so the action is dropped before reaching the panel."""
+    if not isinstance(value, str):
+        return ""
+    name = value.strip()
+    if name.lower().endswith(".json"):
+        name = name[:-5].strip()
+    if not name or len(name) > WORKFLOW_NAME_MAX:
+        return ""
+    if any(ch in WORKFLOW_NAME_CHARS for ch in name) or ".." in name:
+        return ""
+    if any(not ch.isprintable() for ch in name):
+        return ""
+    return name
+
+
 def validate_actions(actions):
     if not isinstance(actions, list):
         return []
@@ -339,6 +364,22 @@ def validate_actions(actions):
             result.append(entry)
         elif action_type == "clear_graph":
             result.append({"type": action_type})
+        elif action_type == "queue_status":
+            result.append({"type": action_type})
+        elif action_type == "queue_cancel":
+            scope = action.get("scope")
+            if scope in {"pending", "running", "all"}:
+                entry = {"type": action_type, "scope": scope}
+                prompt_id = action.get("prompt_id")
+                if prompt_id is not None and isinstance(prompt_id, (int, str)) and 0 < len(str(prompt_id)) <= 64:
+                    entry["prompt_id"] = prompt_id
+                result.append(entry)
+        elif action_type == "workflow_list":
+            result.append({"type": action_type})
+        elif action_type in {"workflow_save", "workflow_load", "workflow_delete"}:
+            name = _workflow_name(action.get("name"))
+            if name:
+                result.append({"type": action_type, "name": name})
     return result
 
 

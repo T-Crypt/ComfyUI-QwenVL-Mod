@@ -721,6 +721,132 @@ async function runModelDownload(action) {
     return `downloaded ${data.filename} (${Math.round((data.bytes || 0) / 1048576)}MB) as ${data.kind} — use exactly '${data.filename}' in widgets`;
 }
 
+function sanitizeWorkflowName(value) {
+    // Mirror of chat_service._workflow_name: plain filename only, .json added
+    // by the caller. The server also rejects traversal; this keeps requests clean.
+    let base = String(value ?? "").trim().replace(/\.json$/i, "").trim();
+    base = base.replace(/[\\/:*?"<>|%]+/g, " ").replace(/\.\./g, " ").replace(/\s+/g, " ").trim();
+    return base.slice(0, 80);
+}
+
+async function runQueueStatus() {
+    const response = await api.fetchApi("/queue");
+    if (!response.ok) throw new Error(`queue status failed: HTTP ${response.status}`);
+    const data = await response.json();
+    const ids = (items) => (Array.isArray(items) ? items : [])
+        .map((item) => String((Array.isArray(item) ? item[1] : item) ?? "")).filter(Boolean).slice(0, 8);
+    const running = ids(data.queue_running);
+    const pending = ids(data.queue_pending);
+    const parts = [
+        `${(data.queue_running || []).length} running${running.length ? ` [${running.join(", ")}]` : ""}`,
+        `${(data.queue_pending || []).length} pending${pending.length ? ` [${pending.join(", ")}]` : ""}`,
+    ];
+    const hist = await api.fetchApi("/history?max_items=3");
+    if (hist.ok) {
+        const history = await hist.json();
+        const recent = Object.values(history || {}).slice(-3).map((entry) =>
+            `${entry?.prompt?.[1] ?? "?"}:${entry?.status?.status_str ?? "?"}`);
+        if (recent.length) parts.push(`recent: ${recent.join(", ")}`);
+    }
+    return `queue: ${parts.join("; ")}`;
+}
+
+async function runQueueCancel(action) {
+    const scope = action.scope || "pending";
+    const done = [];
+    if (scope === "running" || scope === "all") {
+        const response = await api.fetchApi("/interrupt", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            timeoutMs: null,
+            body: JSON.stringify({}),
+        });
+        if (!response.ok) throw new Error(`interrupt failed: HTTP ${response.status}`);
+        done.push("interrupted the running job");
+    }
+    if (scope === "pending" || scope === "all") {
+        let ids = [];
+        if (action.prompt_id != null) {
+            ids = [String(action.prompt_id)];
+        } else {
+            const queue = await (await api.fetchApi("/queue")).json();
+            ids = (queue.queue_pending || []).map((item) => String(item?.[1] ?? "")).filter(Boolean);
+        }
+        if (!ids.length) {
+            done.push("no pending jobs to remove");
+        } else {
+            const response = await api.fetchApi("/queue", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                timeoutMs: null,
+                body: JSON.stringify({ delete: ids }),
+            });
+            if (!response.ok) throw new Error(`queue delete failed: HTTP ${response.status}`);
+            done.push(`removed ${ids.length} pending job(s)`);
+        }
+    }
+    return done.join("; ");
+}
+
+async function runWorkflowList() {
+    const response = await api.fetchApi("/userdata?dir=workflows&recurse=true");
+    if (!response.ok) throw new Error(`workflow list failed: HTTP ${response.status}`);
+    const files = await response.json();
+    const names = (Array.isArray(files) ? files : [])
+        .filter((item) => typeof item === "string" && !item.includes("/"))
+        .map((item) => item.replace(/\.json$/i, ""));
+    if (!names.length) return "no saved workflows yet";
+    const shown = names.slice(0, 60);
+    const extra = names.length > shown.length ? ` (+${names.length - shown.length} more)` : "";
+    return `saved workflows (${names.length}${extra}): ${shown.join(", ")}`;
+}
+
+async function runWorkflowSave(action) {
+    const base = sanitizeWorkflowName(action.name);
+    if (!base) throw new Error("workflow name is empty after sanitizing");
+    const data = app.graph?.serialize?.();
+    if (!data) throw new Error("could not serialize the current graph");
+    const body = JSON.stringify(data);
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+        const name = attempt === 0 ? base : `${base}-${attempt + 1}`;
+        const response = await api.fetchApi(`/userdata/${encodeURIComponent(`workflows/${name}.json`)}?overwrite=false`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            timeoutMs: null,
+            signal: controller?.signal,
+            body,
+        });
+        if (response.status === 409) continue; // name taken: suffix and retry
+        if (!response.ok) throw new Error(`workflow save failed: HTTP ${response.status}`);
+        return `saved '${name}' to the workflow library`;
+    }
+    throw new Error(`could not find a free name for '${base}' (25 attempts)`);
+}
+
+async function runWorkflowLoad(action) {
+    const base = sanitizeWorkflowName(action.name);
+    if (!base) throw new Error("workflow name is empty after sanitizing");
+    const response = await api.fetchApi(`/userdata/${encodeURIComponent(`workflows/${base}.json`)}`, { timeoutMs: null });
+    if (response.status === 404) {
+        const available = await runWorkflowList();
+        throw new Error(`no saved workflow '${base}' — ${available}`);
+    }
+    if (!response.ok) throw new Error(`workflow load failed: HTTP ${response.status}`);
+    const data = await response.json();
+    const loaded = await app.loadGraphData(data, true, true);
+    if (loaded === false) throw new Error(`'${base}' could not be opened (the frontend rejected it)`);
+    return `opened '${base}' from the workflow library`;
+}
+
+async function runWorkflowDelete(action) {
+    const base = sanitizeWorkflowName(action.name);
+    if (!base) throw new Error("workflow name is empty after sanitizing");
+    const response = await api.fetchApi(`/userdata/${encodeURIComponent(`workflows/${base}.json`)}`, { method: "DELETE" });
+    if (response.status === 404) throw new Error(`no saved workflow '${base}' (nothing deleted)`);
+    if (!response.ok) throw new Error(`workflow delete failed: HTTP ${response.status}`);
+    return `deleted '${base}' from the workflow library`;
+}
+
 async function applyActions(actions) {
     const applied = [];
     const rejected = [];
@@ -810,6 +936,28 @@ async function applyActions(actions) {
                 const text = await runModelDownload(action);
                 applied.push(`downloaded model (${action.kind})`);
                 observations.push(text.slice(0, 1000));
+            } else if (action.type === "queue_status") {
+                const text = await runQueueStatus();
+                applied.push("checked the queue");
+                observations.push(text.slice(0, 800));
+            } else if (action.type === "queue_cancel") {
+                const text = await runQueueCancel(action);
+                applied.push(`cancelled (${action.scope})`);
+                observations.push(text.slice(0, 400));
+            } else if (action.type === "workflow_list") {
+                const text = await runWorkflowList();
+                applied.push("listed saved workflows");
+                observations.push(text.slice(0, 2000));
+            } else if (action.type === "workflow_save") {
+                const text = await runWorkflowSave(action);
+                applied.push(text.slice(0, 200));
+            } else if (action.type === "workflow_load") {
+                const text = await runWorkflowLoad(action);
+                applied.push(text.slice(0, 200));
+                observations.push(text.slice(0, 400));
+            } else if (action.type === "workflow_delete") {
+                const text = await runWorkflowDelete(action);
+                applied.push(text.slice(0, 200));
             } else if (action.type === "clear_graph") {
                 const count = (app.graph?._nodes || []).length;
                 app.graph.clear();

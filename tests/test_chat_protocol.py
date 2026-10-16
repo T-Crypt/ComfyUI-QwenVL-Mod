@@ -707,6 +707,42 @@ class ChatProtocolTests(unittest.TestCase):
         for folder in cs.MODELS_CONTEXT_FOLDERS:
             self.assertIn(folder, text)
 
+    def test_accepts_queue_and_workflow_actions(self):
+        actions = validate_actions([
+            {"type": "queue_status"},
+            {"type": "queue_cancel", "scope": "pending", "prompt_id": "abc123"},
+            {"type": "queue_cancel", "scope": "all"},
+            {"type": "workflow_list"},
+            {"type": "workflow_save", "name": "CUSTOM portrait v2.json"},
+            {"type": "workflow_load", "name": "CUSTOM_art-krea.json"},
+            {"type": "workflow_delete", "name": "old test"},
+        ])
+        self.assertEqual(len(actions), 7)
+        self.assertEqual(actions[1]["prompt_id"], "abc123")
+        self.assertEqual(actions[2]["scope"], "all")
+        self.assertEqual(actions[4]["name"], "CUSTOM portrait v2")
+        self.assertEqual(actions[5]["name"], "CUSTOM_art-krea")
+        self.assertEqual(actions[6]["name"], "old test")
+
+    def test_rejects_queue_and_workflow_misuse(self):
+        self.assertEqual(validate_actions([
+            {"type": "queue_cancel", "scope": "everything"},
+            {"type": "workflow_save", "name": "a/b"},
+            {"type": "workflow_save", "name": "../evil"},
+            {"type": "workflow_save", "name": "x" * 101},
+            {"type": "workflow_load", "name": 5},
+            {"type": "workflow_delete", "name": ".json"},
+        ]), [])
+
+    def test_workflow_name_normalization(self):
+        import chat_service as cs
+        self.assertEqual(cs._workflow_name("  My Workflow.json  "), "My Workflow")
+        self.assertEqual(cs._workflow_name("plain"), "plain")
+        self.assertEqual(cs._workflow_name("a\\b"), "")
+        self.assertEqual(cs._workflow_name("a\tb"), "")
+        self.assertEqual(cs._workflow_name(""), "")
+        self.assertEqual(cs._workflow_name(None), "")
+
 if __name__ == "__main__":
     unittest.main()
 

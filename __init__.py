@@ -111,6 +111,44 @@ def _llamaswap_unload(model):
         print(f"[QwenVL Chat] llama-swap unload {model}: {error}")
 
 
+@PromptServer.instance.routes.get("/qwenvl/chat/models")
+async def _chat_models(request):
+    return web.json_response(CHAT_RUNTIME.models())
+
+
+@PromptServer.instance.routes.get("/qwenvl/chat/assets")
+async def _chat_assets(request):
+    return web.json_response(await asyncio.to_thread(list_output_images, folder_paths.get_output_directory()))
+
+
+@PromptServer.instance.routes.post("/qwenvl/chat")
+async def _chat(request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("request body must be an object")
+        options = data.get("options") or {}
+        if not isinstance(options, dict):
+            raise ValueError("options must be an object")
+        result = await asyncio.to_thread(
+            CHAT_RUNTIME.chat,
+            data.get("backend"),
+            data.get("model"),
+            data.get("messages"),
+            data.get("graph"),
+            options,
+            data.get("images"),
+            data.get("video"),
+            data.get("directives"),
+        )
+        return web.json_response(result)
+    except ValueError as error:
+        return web.json_response({"error": str(error)}, status=400)
+    except Exception as error:
+        print(f"[QwenVL Chat] {error}")
+        return web.json_response({"error": "Chat generation failed. Check the ComfyUI console."}, status=500)
+
+
 @PromptServer.instance.routes.post("/qwenvl/chat/unload")
 async def _chat_unload(request):
     try:
