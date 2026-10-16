@@ -2,11 +2,14 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const STORAGE_KEY = "qwenvl.chat.v1";
+const MAX_MESSAGE_CHARS = 48000; // mirrors chat_service.py: overlong history must not 400 every send
 const DEFAULT_GGUF_MODEL = "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-Q8_0.gguf";
+const DEFAULT_API_MODEL = "NInfer-HauHauCS-27B";
 const GGUF_PREFIX = "GGUF: ";
 const HF_PREFIX = "HF: ";
-const modelBackend = () => (state.model || "").startsWith(HF_PREFIX) ? "hf" : "gguf";
-const bareModel = () => (state.model || "").replace(/^(GGUF|HF): /, "");
+const API_PREFIX = "API: ";
+const modelBackend = () => (state.model || "").startsWith(HF_PREFIX) ? "hf" : (state.model || "").startsWith(API_PREFIX) ? "api" : "gguf";
+const bareModel = () => (state.model || "").replace(/^(GGUF|HF|API): /, "");
 const TRANSLATIONS = {
     en: {
         empty: "Ask me to analyze or modify the parameters of the open workflow.", user: "You", thinking: "Thinking",
@@ -149,10 +152,15 @@ function t(key, values = {}) {
     return text;
 }
 
+function validStoredMessage(message) {
+    return message && (message.role === "user" || message.role === "assistant") && typeof message.content === "string" && message.content.trim();
+}
+
 function loadState() {
     try {
         const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-        return { ...DEFAULT_STATE, ...(saved || {}), messages: Array.isArray(saved?.messages) ? saved.messages.slice(-20) : [] };
+        const messages = Array.isArray(saved?.messages) ? saved.messages.filter(validStoredMessage).slice(-20) : [];
+        return { ...DEFAULT_STATE, ...(saved || {}), messages };
     } catch {
         return { ...DEFAULT_STATE };
     }
@@ -631,7 +639,7 @@ async function applyActions(actions) {
         const response = await api.fetchApi("/qwenvl/chat/unload", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ backend: modelBackend() }),
+            body: JSON.stringify({ backend: modelBackend(), model: bareModel() }),
         });
         if (!response.ok) throw new Error(t("unloadError"));
         await app.queuePrompt();
@@ -694,10 +702,13 @@ async function sendMessage() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             signal: controller.signal,
+            // Chat calls outlive ComfyUI frontend's default fetch timeout
+            // (cold model load alone is ~50s): only the Stop button aborts.
+            timeoutMs: null,
             body: JSON.stringify({
                 backend: modelBackend(),
                 model: bareModel(),
-                messages: state.messages,
+                messages: state.messages.map((m) => ({ ...m, content: String(m.content).slice(0, MAX_MESSAGE_CHARS) })),
                 graph: snapshotGraph(),
                 images,
                 video: attachedVideo?.frames || [],
@@ -756,18 +767,20 @@ async function loadModels() {
 }
 
 function populateModels() {
+    const api = (state.availableModels?.api || []).map((m) => API_PREFIX + m);
     const gguf = (state.availableModels?.gguf || []).map((m) => GGUF_PREFIX + m);
     const hf = (state.availableModels?.hf || []).map((m) => HF_PREFIX + m);
-    const models = [...gguf, ...hf];
+    const models = [...api, ...gguf, ...hf];
     elements.model.replaceChildren();
     for (const model of models) {
         const option = createElement("option", "", model);
         option.value = model;
         elements.model.append(option);
     }
+    const preferredApi = API_PREFIX + DEFAULT_API_MODEL;
     const preferred = GGUF_PREFIX + DEFAULT_GGUF_MODEL;
     if (!models.includes(state.model)) {
-        state.model = models.includes(preferred) ? preferred : models[0] || "";
+        state.model = models.includes(preferredApi) ? preferredApi : models.includes(preferred) ? preferred : models[0] || "";
     }
     elements.model.value = state.model;
     saveState();
@@ -870,7 +883,7 @@ function buildSidebar(container) {
     elements.maxTokens = createElement("input");
     elements.maxTokens.type = "number";
     elements.maxTokens.min = "64";
-    elements.maxTokens.max = "8192";
+    elements.maxTokens.max = "32768";
     elements.maxTokens.value = String(state.maxTokens);
     elements.maxTokens.title = "Maximum response tokens";
     elements.temperature = createElement("input");
@@ -955,7 +968,7 @@ function buildSidebar(container) {
         saveState();
     });
     elements.maxTokens.addEventListener("change", () => {
-        state.maxTokens = Math.min(8192, Math.max(64, Number(elements.maxTokens.value) || 1024));
+        state.maxTokens = Math.min(32768, Math.max(64, Number(elements.maxTokens.value) || 1024));
         elements.maxTokens.value = String(state.maxTokens);
         saveState();
     });

@@ -45,6 +45,42 @@ class ChatProtocolTests(unittest.TestCase):
             with self.subTest(messages=messages), self.assertRaises(ValueError):
                 validate_messages(messages)
 
+    def test_truncates_overlong_message_content(self):
+        from chat_service import MAX_MESSAGE_CHARS
+        long_text = "y" * (MAX_MESSAGE_CHARS + 500)
+        result = validate_messages([{"role": "user", "content": long_text}])
+        self.assertEqual(result[0]["content"], "y" * MAX_MESSAGE_CHARS)
+
+    def test_fit_history_to_budget_keeps_latest(self):
+        from chat_service import PROMPT_BUDGET_CHARS, fit_history_to_budget
+        old = [{"role": "user", "content": f"old-{index}-" + "z" * 50000} for index in range(10)]
+        latest = {"role": "user", "content": "the actual request"}
+        fitted = fit_history_to_budget(old + [latest])
+        self.assertEqual(fitted[-1]["content"], "the actual request")
+        self.assertLessEqual(sum(len(m["content"]) for m in fitted), PROMPT_BUDGET_CHARS)
+        self.assertLess(len(fitted), 11)
+
+    def test_api_reasoning_content_surfaces_as_thinking(self):
+        import json as _json
+        from unittest import mock
+        import chat_service as cs
+
+        payload = {"choices": [{"message": {
+            "content": '{"message":"hi","actions":[],"choices":[]}',
+            "reasoning_content": "because reasons",
+        }}]}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return _json.dumps(payload).encode()
+
+        with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp()):
+            text = cs._api_chat_completions("SYS", "PROMPT", [], "M", {"max_tokens": 64})
+        thinking, rest = cs.extract_thinking(text)
+        self.assertEqual(thinking, "because reasons")
+        self.assertIn('"message"', rest)
+
     def test_validates_graph_snapshot(self):
         graph = {"nodes": [{"id": 1, "type": "KSampler", "title": "Sampler", "mode": 0, "widgets": [{"name": "steps", "value": 20}]}]}
         result = validate_graph(graph)

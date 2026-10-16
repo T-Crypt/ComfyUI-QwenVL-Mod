@@ -2,9 +2,13 @@ import base64
 import gc
 import io
 import json
+import os
 import re
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from PIL import Image
@@ -13,12 +17,40 @@ from qwenvl_presets import VL_ALIASES, resolve_preset, resolve_vl_preset
 
 
 MAX_MESSAGES = 20
-MAX_MESSAGE_CHARS = 12000
+MAX_MESSAGE_CHARS = 48000
+# Total history budget (~100-130K tokens): NInfer-HauHauCS-27B has 262144
+# ctx, shared with the workflow snapshot, guides, images and the reply.
+# Oldest messages drop first; the latest user message is never dropped.
+PROMPT_BUDGET_CHARS = 400000
+# Workflow snapshot cap (~35-50K tokens). Values inside are already
+# truncated by validate_graph; this bounds pathological graphs.
+GRAPH_SNAPSHOT_CHARS = 150000
 MAX_GRAPH_NODES = 200
 MAX_CHAT_IMAGES = 3
 MAX_VIDEO_FRAMES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 ALLOWED_ACTIONS = {"set_widget_value", "set_node_mode", "queue_workflow"}
+
+# API backend (llama-swap, OpenAI-compatible). Lets QwenChat's workflow-control
+# protocol run on a served model instead of a locally loaded GGUF/HF weight —
+# no second 27B in ComfyUI's VRAM. Endpoint and model are overridable via env
+# for testing; defaults target aphotic's llama-swap + NInfer-HauHauCS-27B.
+API_BASE_URL = os.environ.get("QWENCHAT_API_BASE_URL", "http://127.0.0.1:9090/v1")
+API_DEFAULT_MODEL = os.environ.get("QWENCHAT_API_MODEL", "NInfer-HauHauCS-27B")
+# Generous: covers queue-wait aftermath, NInfer cold load (~50s), big-prompt
+# prefill and long generations. The browser side opts out of ComfyUI
+# frontend's fetch timeout for this route (timeoutMs: null in chat.js).
+API_TIMEOUT_S = int(os.environ.get("QWENCHAT_API_TIMEOUT_S", "600"))
+
+# Ping-pong: the api chat model (llama-swap) and diffusion weights share one
+# card. Before asking llama-swap to load, yield to any running ComfyUI job
+# (wait at the job boundary, never cutting one off) and then unload Comfy
+# models via POST /free — the mirror of the queue path, which unloads the
+# chat model before a workflow runs. Without this the load collides with
+# resident weights and llama-swap 500s ("upstream command exited prematurely").
+COMFY_URL = os.environ.get("QWENCHAT_COMFY_URL", "http://127.0.0.1:8188")
+WAIT_FOR_IDLE = os.environ.get("QWENCHAT_WAIT_FOR_IDLE", "1") == "1"
+QUEUE_POLL_S = float(os.environ.get("QWENCHAT_QUEUE_POLL_S", "5"))
 MINIMAX_I2VA_BINDING = "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
 
 
@@ -143,15 +175,20 @@ SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + NO_THINKING_INSTRUCTION
 
 def validate_messages(messages):
     if not isinstance(messages, list) or not messages:
-        raise ValueError("messages must be a non-empty list")
+        raise ValueError("invalid chat message content")
     result = []
     for item in messages[-MAX_MESSAGES:]:
         if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
-            raise ValueError("invalid chat message")
-        content = item.get("content")
-        if not isinstance(content, str) or not content.strip() or len(content) > MAX_MESSAGE_CHARS:
             raise ValueError("invalid chat message content")
-        result.append({"role": item["role"], "content": content.strip()})
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("invalid chat message content")
+        content = content.strip()
+        if len(content) > MAX_MESSAGE_CHARS:
+            # A long reply stored in history (up to max_tokens worth) must not
+            # poison every later send with a 400 — truncate, head-kept.
+            content = content[:MAX_MESSAGE_CHARS]
+        result.append({"role": item["role"], "content": content})
     return result
 
 
@@ -705,6 +742,8 @@ def _chat_guides_for(graph, has_images=False):
 def build_prompt(messages, graph, enable_thinking=False, has_images=False, has_video=False):
     history = "\n".join(f"{item['role'].upper()}: {item['content']}" for item in messages)
     snapshot = json.dumps(graph, ensure_ascii=False, separators=(",", ":"))
+    if len(snapshot) > GRAPH_SNAPSHOT_CHARS:
+        snapshot = snapshot[:GRAPH_SNAPSHOT_CHARS]
     instruction = BASE_SYSTEM_PROMPT + _preset_guides(graph, messages, has_images) + _chat_guides_for(graph, has_images)
     instruction += THINKING_INSTRUCTION if enable_thinking else NO_THINKING_INSTRUCTION
     if has_video:
@@ -1082,6 +1121,112 @@ def _explicit_minimax_request(messages, graph):
     return _minimax_result(graph, config_key, last_user)
 
 
+def _comfy_queue_busy():
+    """True while ComfyUI has a job running or pending. Fail-open (False) —
+    if the snapshot can't be read, don't block chat on it."""
+    try:
+        with urllib.request.urlopen(COMFY_URL.rstrip("/") + "/queue", timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        print(f"[QwenVL Chat] queue snapshot failed ({error}); proceeding")
+        return False
+    return bool(data.get("queue_running") or data.get("queue_pending"))
+
+
+def _comfy_free():
+    """Unload ComfyUI models (POST /free never interrupts a running job, so
+    callers wait for idle first). Best-effort: failure only logs."""
+    try:
+        request = urllib.request.Request(COMFY_URL.rstrip("/") + "/free", data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+    except Exception as error:
+        print(f"[QwenVL Chat] ComfyUI /free failed ({error})")
+
+
+def _await_comfy_idle():
+    if not WAIT_FOR_IDLE:
+        return
+    while _comfy_queue_busy():
+        time.sleep(QUEUE_POLL_S)
+    _comfy_free()
+
+
+def fit_history_to_budget(messages):
+    """Drop oldest messages until the history fits PROMPT_BUDGET_CHARS.
+    The latest message (the actual request) is never dropped."""
+    total = sum(len(item["content"]) for item in messages)
+    index = 0
+    while total > PROMPT_BUDGET_CHARS and len(messages) - index > 1:
+        total -= len(messages[index]["content"])
+        index += 1
+    return messages[index:]
+
+
+def _api_models():
+    """Model list for the API backend. Static default so the dropdown works
+    even when llama-swap is down; the configured model is always the default."""
+    return [API_DEFAULT_MODEL]
+
+
+def _api_chat_completions(system, user_text, images_b64, model_name, options):
+    """POST one OpenAI-compatible chat request to llama-swap. Images go as
+    data-URL parts on the user message (NInfer-HauHauCS-27B takes vision)."""
+    content = [{"type": "text", "text": user_text}]
+    for b64 in images_b64 or []:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": int(options.get("max_tokens", 1024)),
+        "temperature": float(options.get("temperature", 0.2)),
+        "top_p": float(options.get("top_p", 0.9)),
+    }
+    try:
+        seed = int(options.get("seed", 1))
+    except (TypeError, ValueError):
+        seed = None
+    if seed is not None:
+        payload["seed"] = seed
+    body = json.dumps(payload).encode("utf-8")
+    url = API_BASE_URL.rstrip("/") + "/chat/completions"
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=API_TIMEOUT_S) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        try:
+            detail = error.read().decode("utf-8")[:500]
+        except Exception:
+            detail = ""
+        raise ValueError(f"llama-swap API error HTTP {error.code}: {detail or error.reason}")
+    except urllib.error.URLError as error:
+        raise ValueError(f"llama-swap not reachable at {API_BASE_URL} ({error.reason}). Is llama-swap running?")
+    except TimeoutError:
+        raise ValueError(f"llama-swap request timed out after {API_TIMEOUT_S}s (cold model load can take ~1 min; retry once).")
+    choices = (data or {}).get("choices") or []
+    message = (choices[0].get("message") if choices else None) or {}
+    text = message.get("content") or ""
+    reasoning = message.get("reasoning_content") or ""
+    if not isinstance(text, str):
+        text = str(text)
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning)
+    if not text.strip() and reasoning.strip():
+        text = reasoning
+    elif reasoning.strip() and text.strip() and reasoning.strip() not in text:
+        # NInfer (preserve-thinking) reasons in a separate field: fold it
+        # into the <think> block so extract_thinking surfaces it in the
+        # panel's Thinking view instead of dropping it.
+        text = f"{THINK_OPEN}{reasoning.strip()}{THINK_CLOSE}\n{text}"
+    if not text.strip():
+        raise ValueError(f"llama-swap returned an empty reply: {str(data)[:500]}")
+    return text
+
+
 class ChatRuntime:
     def __init__(self):
         self._instances = {}
@@ -1093,10 +1238,11 @@ class ChatRuntime:
         # HF_ALL_MODELS includes both VL and text-only models (Qwen3.5/3.8).
         hf_models = sorted((getattr(hf, "HF_ALL_MODELS", {}) or {}).keys()) if hf else []
         gguf_models = sorted(((getattr(gguf, "GGUF_VL_CATALOG", {}) or {}).get("models") or {}).keys()) if gguf else []
-        return {"hf": hf_models, "gguf": gguf_models}
+        return {"hf": hf_models, "gguf": gguf_models, "api": _api_models()}
 
     def chat(self, backend, model_name, messages, graph, options, images=None, video=None, directives=None):
         messages = validate_messages(messages)
+        messages = fit_history_to_budget(messages)
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 expanded = _expand_wildcard_tokens(messages[i].get("content", ""))
@@ -1118,7 +1264,7 @@ class ChatRuntime:
             return explicit
         available = self.models().get(backend)
         if available is None:
-            raise ValueError("backend must be hf or gguf")
+            raise ValueError("backend must be hf, gguf, or api")
         if not available:
             raise ValueError(f"no models available for backend '{backend}'")
         if not model_name:
@@ -1159,7 +1305,23 @@ class ChatRuntime:
     def _generate(self, backend, model_name, prompt, options, enable_thinking, images, video=None):
         if backend == "hf":
             return self._chat_hf(model_name, prompt, options, enable_thinking, images, video)
+        if backend == "api":
+            return self._chat_api(model_name, prompt, options, enable_thinking, images, video)
         return self._chat_gguf(model_name, prompt, options, enable_thinking, images, video)
+
+    def _chat_api(self, model_name, prompt, options, enable_thinking=False, images=None, video=None):
+        # Ping-pong first: a finished workflow leaves diffusion weights
+        # resident, and a running one owns the card — wait behind the job,
+        # free the weights, then load the chat model into a free card.
+        # (Runs under ChatRuntime's lock; the retry path re-checks cheaply.)
+        _await_comfy_idle()
+        # Reuse the exact prompt the local backends get (system rules +
+        # workflow snapshot + conversation) as the user message, with the
+        # protocol system prompt as `system` — so workflow control (actions,
+        # choices, bindings) behaves identically regardless of backend.
+        system = BASE_SYSTEM_PROMPT + (THINKING_INSTRUCTION if enable_thinking else NO_THINKING_INSTRUCTION)
+        images_b64 = [base64.b64encode(data).decode("ascii") for data in (images or []) + (video or [])]
+        return _api_chat_completions(system, prompt, images_b64, model_name, options)
 
     def _chat_hf(self, model_name, prompt, options, enable_thinking=False, images=None, video=None):
         module = sys.modules["AILab_QwenVL"]
@@ -1224,8 +1386,8 @@ class ChatRuntime:
         )
 
     def unload(self, backend="all"):
-        if backend not in {"hf", "gguf", "all"}:
-            raise ValueError("backend must be hf, gguf, or all")
+        if backend not in {"hf", "gguf", "api", "all"}:
+            raise ValueError("backend must be hf, gguf, api, or all")
         with self._lock:
             targets = list(self._instances) if backend == "all" else [backend]
             for target in targets:

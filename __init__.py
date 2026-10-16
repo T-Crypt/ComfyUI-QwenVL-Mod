@@ -3,6 +3,7 @@ import html
 import importlib.util
 import os
 import sys
+import urllib.request
 
 from aiohttp import web
 import folder_paths
@@ -90,6 +91,22 @@ if os.path.exists(nodes_dir):
 from chat_service import CHAT_RUNTIME, list_output_images
 
 
+_LLAMA_SWAP_URL = os.environ.get("LLAMA_SWAP_URL", "http://127.0.0.1:9090")
+
+
+def _llamaswap_unload(model):
+    """Unload one llama-swap model (the api-backend chat model) so a queued
+    workflow has the card. Verified against POST /api/models/unload/:name."""
+    model = model or os.environ.get("QWENCHAT_API_MODEL", "NInfer-HauHauCS-27B")
+    url = _LLAMA_SWAP_URL.rstrip("/") + "/api/models/unload/" + str(model)
+    try:
+        request = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+    except Exception as error:
+        print(f"[QwenVL Chat] llama-swap unload {model}: {error}")
+
+
 @PromptServer.instance.routes.get("/qwenvl/chat/models")
 async def _chat_models(request):
     return web.json_response(CHAT_RUNTIME.models())
@@ -133,6 +150,11 @@ async def _chat_unload(request):
     try:
         data = await request.json()
         backend = data.get("backend", "all") if isinstance(data, dict) else "all"
+        if backend == "api":
+            # The chat model lives in llama-swap, not in this process: free
+            # the card before the queued workflow loads diffusion weights.
+            # Best-effort — a down llama-swap must not fail the queue path.
+            await asyncio.to_thread(_llamaswap_unload, data.get("model") if isinstance(data, dict) else None)
         unloaded = await asyncio.to_thread(CHAT_RUNTIME.unload, backend)
         return web.json_response({"status": "success", "unloaded": unloaded})
     except ValueError as error:
