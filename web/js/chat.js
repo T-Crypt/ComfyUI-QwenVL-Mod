@@ -70,7 +70,7 @@ const DEFAULT_STATE = {
     language: "en",
     settingsOpen: false,
     model: "",
-    maxTokens: 1024,
+    maxTokens: 4096,
     temperature: 0.2,
     thinking: false,
     config: "auto",

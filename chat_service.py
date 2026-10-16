@@ -182,7 +182,7 @@ Your response must START with "{" and END with "}". Do not analyze, explain, or 
 Allowed actions: set_widget_value, set_node_mode (bypass/enable only), queue_workflow, add_node, remove_node, connect, disconnect, layout, search_models, download_model, clear_graph, queue_status, queue_cancel, workflow_list, workflow_save, workflow_load, workflow_delete. Never invent numeric node IDs or widget names — nodes you create are referenced by the key you assign them (see 4). Never emit code, shell, filesystem, JS, or network actions.
 When asked to generate/run/queue, apply every required widget update and include queue_workflow in the same response. Never ask "execute now?" after queue_workflow. If you only set a prompt without queue_workflow, do not claim execution started.
 When asked to fix or resolve errors in the workflow, emit the correcting actions (set_widget_value, connect, disconnect, ...) and include queue_workflow when the user wants it run — describing the errors is not enough.
-When a fix involves multiple nodes or widgets, emit ONE action per response (e.g. one set_widget_value). The panel applies it and you can continue with the next fix in the following round. Do not try to fix everything at once.
+When a fix involves several nodes or widgets, emit every action the request needs in the same response (up to about 30 actions); the panel applies them together and reports rejected ones back. Split across rounds only when the work is larger than that or a rejected action needs a different value.
 Choices are top-level, only when truly ambiguous. Always close braces.
 ---
 WORKFLOW TARGETS (pick the FIRST matching case for the node you are controlling):
@@ -1545,7 +1545,9 @@ def download_model(url, kind, filename=None, token=None):
 
 def _api_chat_completions(system, user_text, images_b64, model_name, options):
     """POST one OpenAI-compatible chat request to llama-swap. Images go as
-    data-URL parts on the user message (NInfer-HauHauCS-27B takes vision)."""
+    data-URL parts on the user message (NInfer-HauHauCS-27B takes vision).
+    Returns (text, finish_reason); "length" means the reply was truncated
+    at max_tokens."""
     content = [{"type": "text", "text": user_text}]
     for b64 in images_b64 or []:
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
@@ -1582,6 +1584,9 @@ def _api_chat_completions(system, user_text, images_b64, model_name, options):
     except TimeoutError:
         raise ValueError(f"llama-swap request timed out after {API_TIMEOUT_S}s (cold model load can take ~1 min; retry once).")
     choices = (data or {}).get("choices") or []
+    finish_reason = ""
+    if choices and isinstance(choices[0], dict):
+        finish_reason = choices[0].get("finish_reason") or ""
     message = (choices[0].get("message") if choices else None) or {}
     text = message.get("content") or ""
     reasoning = message.get("reasoning_content") or ""
@@ -1598,7 +1603,7 @@ def _api_chat_completions(system, user_text, images_b64, model_name, options):
         text = f"{THINK_OPEN}{reasoning.strip()}{THINK_CLOSE}\n{text}"
     if not text.strip():
         raise ValueError(f"llama-swap returned an empty reply: {str(data)[:500]}")
-    return text
+    return text, finish_reason
 
 
 class ChatRuntime:
@@ -1651,14 +1656,21 @@ class ChatRuntime:
             # Thinking consumes tokens before the JSON reply; a small budget
             # truncates the response after the reasoning and no JSON is emitted.
             options["max_tokens"] = max(int(options.get("max_tokens", 1024)), 4096)
+        elif backend == "api":
+            # Action-heavy replies (a dozen set_widget_value objects and up)
+            # run past 1024 tokens; the truncation cuts the JSON mid-object
+            # and the parser cannot repair it.
+            options["max_tokens"] = max(int(options.get("max_tokens", 1024)), 4096)
+        base_max_tokens = int(options.get("max_tokens", 1024))
         prompt = build_prompt(messages, graph, enable_thinking, bool(images), bool(video))
         with self._lock:
-            text = self._generate(backend, model_name, prompt, options, enable_thinking, images, video)
+            text, finish_reason = self._generate(backend, model_name, prompt, options, enable_thinking, images, video)
         MAX_JSON_ATTEMPTS = 3
         result = parse_model_response(text)
         attempts = 1
         while not result.get("parsed") and attempts < MAX_JSON_ATTEMPTS:
             attempts += 1
+            truncated = finish_reason == "length"
             if attempts == 2:
                 reminder = (
                     "FAILURE: You did not return a JSON object. Output EXACTLY one JSON object and nothing else:\n"
@@ -1671,13 +1683,24 @@ class ChatRuntime:
                     '{"message":"Fixed KSampler widgets","actions":[{"type":"set_widget_value","node_id":12,"widget":"control_after_generate","value":"fixed"},{"type":"set_widget_value","node_id":12,"widget":"steps","value":20},{"type":"set_widget_value","node_id":12,"widget":"cfg","value":1},{"type":"set_widget_value","node_id":12,"widget":"sampler_name","value":"euler"},{"type":"set_widget_value","node_id":12,"widget":"scheduler","value":"simple"}],"choices":[]}\n'
                     "Replace the example node ids and values with the actual fixes. No prose before or after. Only JSON."
                 )
+            # A truncated reply needs room to finish, and every retry needs a
+            # fresh sample: the same seed replays the same broken sampling.
+            retry_options = dict(options)
+            retry_options["max_tokens"] = max(base_max_tokens, min(max(base_max_tokens * (2 ** (attempts - 1)), 8192), 16384))
+            seed = retry_options.get("seed")
+            if isinstance(seed, int):
+                retry_options["seed"] = seed + 49297 * attempts
+            print(f"[QwenVL Chat] not JSON (finish_reason={finish_reason or 'none'}); "
+                  f"retry {attempts} with max_tokens={retry_options['max_tokens']}")
+            opener = ("Your previous reply was cut off before the JSON was complete. "
+                      "Emit only the JSON object and keep the message field short.\n") if truncated else ""
             retry_messages = messages + [
                 {"role": "assistant", "content": (text or "")[:2000]},
-                {"role": "user", "content": "Your reply was not a JSON object and applied no workflow changes. " + reminder},
+                {"role": "user", "content": opener + "Your reply was not a JSON object and applied no workflow changes. " + reminder},
             ]
             retry_prompt = build_prompt(retry_messages, graph, enable_thinking, bool(images), bool(video))
             with self._lock:
-                retry_text = self._generate(backend, model_name, retry_prompt, options, enable_thinking, images, video)
+                retry_text, finish_reason = self._generate(backend, model_name, retry_prompt, retry_options, enable_thinking, images, video)
             text = retry_text
             result = parse_model_response(text)
         # Keep "parsed" in the payload so the frontend can tell whether the
@@ -1688,10 +1711,10 @@ class ChatRuntime:
 
     def _generate(self, backend, model_name, prompt, options, enable_thinking, images, video=None):
         if backend == "hf":
-            return self._chat_hf(model_name, prompt, options, enable_thinking, images, video)
+            return self._chat_hf(model_name, prompt, options, enable_thinking, images, video), ""
         if backend == "api":
             return self._chat_api(model_name, prompt, options, enable_thinking, images, video)
-        return self._chat_gguf(model_name, prompt, options, enable_thinking, images, video)
+        return self._chat_gguf(model_name, prompt, options, enable_thinking, images, video), ""
 
     def _chat_api(self, model_name, prompt, options, enable_thinking=False, images=None, video=None):
         # Ping-pong first: a finished workflow leaves diffusion weights

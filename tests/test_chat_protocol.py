@@ -76,10 +76,51 @@ class ChatProtocolTests(unittest.TestCase):
             def read(self): return _json.dumps(payload).encode()
 
         with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp()):
-            text = cs._api_chat_completions("SYS", "PROMPT", [], "M", {"max_tokens": 64})
+            text, finish = cs._api_chat_completions("SYS", "PROMPT", [], "M", {"max_tokens": 64})
         thinking, rest = cs.extract_thinking(text)
         self.assertEqual(thinking, "because reasons")
         self.assertIn('"message"', rest)
+        self.assertEqual(finish, "")
+
+    def test_api_chat_completions_reports_truncated_finish_reason(self):
+        import json as _json
+        from unittest import mock
+        import chat_service as cs
+
+        payload = {"choices": [{"finish_reason": "length", "message": {"content": '{"message":"cut'}}]}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return _json.dumps(payload).encode()
+
+        with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp()):
+            text, finish = cs._api_chat_completions("SYS", "PROMPT", [], "M", {"max_tokens": 64})
+        self.assertEqual(finish, "length")
+        self.assertIn("cut", text)
+
+    def test_chat_retry_escalates_budget_and_seed_on_truncation(self):
+        from unittest import mock
+        import chat_service as cs
+
+        calls = []
+
+        def fake_generate(self, backend, model_name, prompt, options, enable_thinking, images, video=None):
+            calls.append({"prompt": prompt, "options": dict(options)})
+            if len(calls) < 3:
+                return '{"message":"fixing","actions":[{"type":"set_widget_value","node_id":12,"wid', "length"
+            return '{"message":"done","actions":[],"choices":[]}', "stop"
+
+        runtime = cs.ChatRuntime()
+        with mock.patch.object(cs.ChatRuntime, "_generate", fake_generate):
+            result = runtime.chat("api", None, [{"role": "user", "content": "fix all four KSamplers"}], {"nodes": []}, {"max_tokens": 1024, "seed": 7})
+        self.assertTrue(result["parsed"])
+        self.assertEqual(calls[0]["options"]["max_tokens"], 4096)
+        self.assertGreaterEqual(calls[1]["options"]["max_tokens"], 8192)
+        self.assertGreaterEqual(calls[2]["options"]["max_tokens"], 16384)
+        self.assertNotEqual(calls[1]["options"]["seed"], 7)
+        self.assertIn("cut off", calls[1]["prompt"])
+        self.assertIn("cut off", calls[2]["prompt"])
 
     def test_accepts_structural_actions(self):
         actions = validate_actions([
@@ -829,7 +870,7 @@ class ChatProtocolTests(unittest.TestCase):
 
         def fake_generate(backend, model_name, prompt, options, enable_thinking, images, video):
             calls.append((backend, model_name, enable_thinking))
-            return responses.pop(0)
+            return responses.pop(0), ""
 
         runtime._generate = fake_generate
         return runtime, calls
