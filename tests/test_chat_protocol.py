@@ -404,7 +404,7 @@ class ChatProtocolTests(unittest.TestCase):
 
             def generate(self, *args, **kwargs):
                 self.kwargs = kwargs
-                self.frame_count = args[3]
+                self.frame_count = args[4]
                 return '{"message":"ok","actions":[]}'
 
         previous = sys.modules.get("AILab_QwenVL")

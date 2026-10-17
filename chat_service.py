@@ -68,6 +68,14 @@ API_DEFAULT_MODEL = os.environ.get("QWENCHAT_API_MODEL", "NInfer-HauHauCS-27B")
 # prefill and long generations. The browser side opts out of ComfyUI
 # frontend's fetch timeout for this route (timeoutMs: null in chat.js).
 API_TIMEOUT_S = int(os.environ.get("QWENCHAT_API_TIMEOUT_S", "600"))
+# A send that races a cold NInfer load gets a fast failure (HTTP 502/503, or a
+# 500 with "upstream command exited prematurely") or a refused connection while
+# llama-swap respawns the server. Retry inside _api_chat_completions, the one
+# owner of transport retries, so the panel's round loop never multiplies them.
+API_RETRY_ATTEMPTS = int(os.environ.get("QWENCHAT_API_RETRY_ATTEMPTS", "2"))
+API_RETRY_BACKOFF_S = float(os.environ.get("QWENCHAT_API_RETRY_BACKOFF_S", "3"))
+API_RETRY_STATUSES = {502, 503}
+API_RETRY_HINTS = ("upstream command exited prematurely", "loading model", "starting")
 
 # Ping-pong: the api chat model (llama-swap) and diffusion weights share one
 # card. Before asking llama-swap to load, yield to any running ComfyUI job
@@ -1543,6 +1551,17 @@ def download_model(url, kind, filename=None, token=None):
     return {"filename": os.path.basename(target), "bytes": total, "kind": kind, "folder": folder}
 
 
+def _api_retryable(status, detail):
+    """Whether a fast llama-swap failure is the cold-load race rather than the
+    caller's fault. 502/503 always retry. A 500 retries only when its body
+    names a respawn ("upstream command exited prematurely" and friends), so a
+    genuine server error is not re-run."""
+    if status in API_RETRY_STATUSES:
+        return True
+    body = (detail or "").lower()
+    return status == 500 and any(hint in body for hint in API_RETRY_HINTS)
+
+
 def _api_chat_completions(system, user_text, images_b64, model_name, options):
     """POST one OpenAI-compatible chat request to llama-swap. Images go as
     data-URL parts on the user message (NInfer-HauHauCS-27B takes vision).
@@ -1570,19 +1589,38 @@ def _api_chat_completions(system, user_text, images_b64, model_name, options):
     body = json.dumps(payload).encode("utf-8")
     url = API_BASE_URL.rstrip("/") + "/chat/completions"
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=API_TIMEOUT_S) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
+    attempt = 0
+    while True:
         try:
-            detail = error.read().decode("utf-8")[:500]
-        except Exception:
-            detail = ""
-        raise ValueError(f"llama-swap API error HTTP {error.code}: {detail or error.reason}")
-    except urllib.error.URLError as error:
-        raise ValueError(f"llama-swap not reachable at {API_BASE_URL} ({error.reason}). Is llama-swap running?")
-    except TimeoutError:
-        raise ValueError(f"llama-swap request timed out after {API_TIMEOUT_S}s (cold model load can take ~1 min; retry once).")
+            with urllib.request.urlopen(request, timeout=API_TIMEOUT_S) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            try:
+                detail = error.read().decode("utf-8")[:500]
+            except Exception:
+                detail = ""
+            if _api_retryable(error.code, detail) and attempt < API_RETRY_ATTEMPTS:
+                attempt += 1
+                wait = API_RETRY_BACKOFF_S * attempt
+                print(f"[QwenVL Chat] llama-swap HTTP {error.code} ({detail[:120] or error.reason}); "
+                      f"retry {attempt}/{API_RETRY_ATTEMPTS} in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            raise ValueError(f"llama-swap API error HTTP {error.code}: {detail or error.reason}")
+        except urllib.error.URLError as error:
+            # A refused or reset connection is llama-swap respawning the server;
+            # a name error or a timeout is not worth a blind retry here.
+            if isinstance(error.reason, ConnectionError) and attempt < API_RETRY_ATTEMPTS:
+                attempt += 1
+                wait = API_RETRY_BACKOFF_S * attempt
+                print(f"[QwenVL Chat] llama-swap connection {error.reason}; "
+                      f"retry {attempt}/{API_RETRY_ATTEMPTS} in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            raise ValueError(f"llama-swap not reachable at {API_BASE_URL} ({error.reason}). Is llama-swap running?")
+        except TimeoutError:
+            raise ValueError(f"llama-swap request timed out after {API_TIMEOUT_S}s (cold model load can take ~1 min; retry once).")
     choices = (data or {}).get("choices") or []
     finish_reason = ""
     if choices and isinstance(choices[0], dict):

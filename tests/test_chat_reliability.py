@@ -242,7 +242,9 @@ class ApiChatCompletionsTests(unittest.TestCase):
 
     def _attempt(self, error):
         from chat_service import _api_chat_completions
-        with patch("urllib.request.urlopen", side_effect=error):
+        # Single attempt: these cases pin the error mapping, not the retry.
+        with patch("urllib.request.urlopen", side_effect=error), \
+                patch("chat_service.API_RETRY_ATTEMPTS", 0):
             _api_chat_completions("system", "user", [], "NInfer-HauHauCS-27B", {"max_tokens": 8})
 
     def test_http_502_maps_to_actionable_value_error(self):
@@ -267,6 +269,109 @@ class ApiChatCompletionsTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             self._attempt(TimeoutError())
         self.assertIn("timed out", str(caught.exception))
+
+
+class ColdLoadRetryTests(unittest.TestCase):
+    """Finding 2: a chat that races a cold NInfer load must retry the fast
+    llama-swap failure instead of surfacing it to the panel."""
+
+    def _call(self):
+        from chat_service import _api_chat_completions
+        return _api_chat_completions("system", "user", [], "NInfer-HauHauCS-27B", {"max_tokens": 8})
+
+    def test_502_retries_then_returns_the_reply(self):
+        calls = []
+
+        def urlopen(request, timeout=None):
+            calls.append(request)
+            if len(calls) < 3:
+                raise _http_error(502, "Bad Gateway", b"upstream command exited prematurely")
+            return _json_response({"choices": [{"message": {"content": '{"message":"hi","actions":[]}'}}]})
+
+        with patch("urllib.request.urlopen", side_effect=urlopen), \
+                patch("chat_service.API_RETRY_ATTEMPTS", 2), \
+                patch("chat_service.API_RETRY_BACKOFF_S", 0.0):
+            text, finish = self._call()
+        self.assertIn('"message":"hi"', text)
+        self.assertEqual(len(calls), 3)
+
+    def test_502_exhausts_retries_and_names_the_failure(self):
+        with patch("urllib.request.urlopen",
+                   side_effect=_http_error(502, "Bad Gateway", b"upstream command exited prematurely")), \
+                patch("chat_service.API_RETRY_ATTEMPTS", 2), \
+                patch("chat_service.API_RETRY_BACKOFF_S", 0.0):
+            with self.assertRaises(ValueError) as caught:
+                self._call()
+        self.assertIn("HTTP 502", str(caught.exception))
+
+    def test_500_without_the_respawn_hint_does_not_retry(self):
+        calls = []
+
+        def urlopen(request, timeout=None):
+            calls.append(request)
+            raise _http_error(500, "Internal Server Error", b"real bug")
+
+        with patch("urllib.request.urlopen", side_effect=urlopen), \
+                patch("chat_service.API_RETRY_ATTEMPTS", 2), \
+                patch("chat_service.API_RETRY_BACKOFF_S", 0.0):
+            with self.assertRaises(ValueError):
+                self._call()
+        self.assertEqual(len(calls), 1)
+
+    def test_500_with_the_respawn_hint_retries(self):
+        calls = []
+
+        def urlopen(request, timeout=None):
+            calls.append(request)
+            if len(calls) == 1:
+                raise _http_error(500, "Internal Server Error", b"upstream command exited prematurely")
+            return _json_response({"choices": [{"message": {"content": '{"message":"ok","actions":[]}'}}]})
+
+        with patch("urllib.request.urlopen", side_effect=urlopen), \
+                patch("chat_service.API_RETRY_ATTEMPTS", 2), \
+                patch("chat_service.API_RETRY_BACKOFF_S", 0.0):
+            text, _ = self._call()
+        self.assertIn('"message":"ok"', text)
+        self.assertEqual(len(calls), 2)
+
+    def test_connection_refused_retries(self):
+        calls = []
+
+        def urlopen(request, timeout=None):
+            calls.append(request)
+            if len(calls) == 1:
+                raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+            return _json_response({"choices": [{"message": {"content": '{"message":"ok","actions":[]}'}}]})
+
+        with patch("urllib.request.urlopen", side_effect=urlopen), \
+                patch("chat_service.API_RETRY_ATTEMPTS", 2), \
+                patch("chat_service.API_RETRY_BACKOFF_S", 0.0):
+            text, _ = self._call()
+        self.assertIn('"message":"ok"', text)
+        self.assertEqual(len(calls), 2)
+
+    def test_timeout_is_not_retried(self):
+        calls = []
+
+        def urlopen(request, timeout=None):
+            calls.append(request)
+            raise TimeoutError()
+
+        with patch("urllib.request.urlopen", side_effect=urlopen), \
+                patch("chat_service.API_RETRY_ATTEMPTS", 2), \
+                patch("chat_service.API_RETRY_BACKOFF_S", 0.0):
+            with self.assertRaises(ValueError) as caught:
+                self._call()
+        self.assertIn("timed out", str(caught.exception))
+        self.assertEqual(len(calls), 1)
+
+    def test_retryable_status_helper(self):
+        from chat_service import _api_retryable
+        self.assertTrue(_api_retryable(502, ""))
+        self.assertTrue(_api_retryable(503, "loading model"))
+        self.assertFalse(_api_retryable(400, "bad request"))
+        self.assertFalse(_api_retryable(500, "disk full"))
+        self.assertTrue(_api_retryable(500, "Upstream command exited prematurely"))
 
 
 if __name__ == "__main__":
