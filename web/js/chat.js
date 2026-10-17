@@ -1402,10 +1402,10 @@ async function sendMessage() {
     }
     try {
         // Agent loop: act, observe (tool results feed back as OBSERVATION
-        // messages with a fresh graph snapshot), continue — up to 3 rounds.
-        // Observations earn extra rounds; bare rejections earn one retry.
-        // A queued workflow always ends the loop.
-        const MAX_ROUNDS = 3;
+        // messages with a fresh graph snapshot), continue. Observations earn
+        // extra rounds; bare rejections earn one retry. A queued workflow or a
+        // proposed plan always ends the loop.
+        const MAX_ROUNDS = 5;
         let data = null;
         let result = { applied: [], rejected: [], observations: [], queued: false };
         for (let round = 0; ; round++) {
