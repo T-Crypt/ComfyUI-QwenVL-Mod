@@ -91,7 +91,7 @@ nodes_dir = os.path.join(current_dir, "nodes")
 if os.path.exists(nodes_dir):
     load_modules_from_directory(nodes_dir)
 
-from chat_service import CHAT_RUNTIME, list_output_images
+from chat_service import CHAT_RUNTIME, list_output_images, TOOL_SCHEMAS
 from chat_service import DOWNLOAD_KINDS, civitai_search, download_model
 
 
@@ -114,6 +114,11 @@ def _llamaswap_unload(model):
 @PromptServer.instance.routes.get("/qwenvl/chat/models")
 async def _chat_models(request):
     return web.json_response(CHAT_RUNTIME.models())
+
+
+@PromptServer.instance.routes.get("/qwenvl/chat/tools")
+async def _chat_tools(request):
+    return web.json_response({"tools": TOOL_SCHEMAS})
 
 
 @PromptServer.instance.routes.get("/qwenvl/chat/assets")

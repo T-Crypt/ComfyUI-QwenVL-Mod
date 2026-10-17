@@ -911,6 +911,113 @@ class ChatProtocolTests(unittest.TestCase):
         self.assertEqual(result["actions"], [])
         self.assertEqual(len(calls), 3)
 
+class AgentToolRegistryTests(unittest.TestCase):
+    """The tool registry is one source of truth for the schemas, the prompt and
+    validate_actions, and for translating OpenAI tool calls into actions."""
+
+    def test_tool_schemas_are_valid_openai_functions(self):
+        from chat_service import TOOLS, TOOL_SCHEMAS
+        self.assertEqual(len(TOOL_SCHEMAS), len(TOOLS))
+        seen = set()
+        for schema in TOOL_SCHEMAS:
+            with self.subTest(tool=schema["function"]["name"]):
+                self.assertEqual(schema["type"], "function")
+                function = schema["function"]
+                self.assertTrue(function["name"])
+                self.assertNotIn(function["name"], seen)
+                seen.add(function["name"])
+                self.assertTrue(function["description"])
+                params = function["parameters"]
+                self.assertEqual(params["type"], "object")
+                self.assertIsInstance(params["properties"], dict)
+                self.assertIsInstance(params["required"], list)
+                self.assertFalse(params["additionalProperties"])
+
+    def test_prompt_names_every_tool_and_the_list_is_filled(self):
+        from chat_service import BASE_SYSTEM_PROMPT, TOOLS
+        self.assertNotIn("[[TOOL_LIST]]", BASE_SYSTEM_PROMPT)
+        for tool in TOOLS:
+            with self.subTest(tool=tool["name"]):
+                self.assertIn(tool["name"], BASE_SYSTEM_PROMPT)
+
+    def test_unknown_or_unhashable_action_type_is_dropped(self):
+        self.assertEqual(validate_actions([{"type": "nonsense"}]), [])
+        self.assertEqual(validate_actions([{"type": ["set_widget_value"]}]), [])
+        self.assertEqual(validate_actions([{"type": "layout"}]), [{"type": "layout"}])
+
+    def test_tool_calls_fold_into_canonical_actions(self):
+        import chat_service as cs
+        text = cs._tool_calls_to_json("done", [
+            {"function": {"name": "set_widget_value",
+                          "arguments": '{"node_id": 12, "widget": "steps", "value": 20}'}},
+            {"function": {"name": "queue_workflow", "arguments": "{}"}},
+        ])
+        result = parse_model_response(text)
+        self.assertTrue(result["parsed"])
+        self.assertEqual(result["message"], "done")
+        self.assertEqual(result["actions"], [
+            {"type": "set_widget_value", "node_id": 12, "widget": "steps", "value": 20},
+            {"type": "queue_workflow"},
+        ])
+
+    def test_tool_calls_with_bad_arguments_drop_the_action(self):
+        import chat_service as cs
+        text = cs._tool_calls_to_json("", [
+            {"function": {"name": "connect", "arguments": "not json"}},
+            {"function": {"name": "set_widget_value", "arguments": '{"node_id": 1}'}},
+        ])
+        result = parse_model_response(text)
+        self.assertTrue(result["parsed"])
+        self.assertEqual(result["actions"], [])
+
+    def test_api_reply_tool_calls_become_actions(self):
+        import json as _json
+        from unittest import mock
+        import chat_service as cs
+
+        payload = {"choices": [{"finish_reason": "tool_calls", "message": {
+            "content": "",
+            "tool_calls": [{"function": {"name": "queue_workflow", "arguments": "{}"}}],
+        }}]}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return _json.dumps(payload).encode()
+
+        with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp()):
+            text, finish = cs._api_chat_completions("SYS", "PROMPT", [], "M", {}, cs.TOOL_SCHEMAS)
+        self.assertEqual(finish, "tool_calls")
+        result = cs.parse_model_response(text)
+        self.assertEqual(result["actions"], [{"type": "queue_workflow"}])
+
+    def test_tools_reach_the_llama_swap_payload_only_when_set(self):
+        import json as _json
+        from unittest import mock
+        import chat_service as cs
+
+        captured = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return _json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode()
+
+        def fake_urlopen(request, timeout=None):
+            captured["body"] = _json.loads(request.data.decode("utf-8"))
+            return _Resp()
+
+        with mock.patch.object(cs.urllib.request, "urlopen", side_effect=fake_urlopen):
+            cs._api_chat_completions("SYS", "PROMPT", [], "M", {},
+                                     [{"type": "function", "function": {"name": "layout"}}])
+        self.assertEqual(captured["body"]["tools"][0]["function"]["name"], "layout")
+        self.assertEqual(captured["body"]["tool_choice"], "auto")
+
+        with mock.patch.object(cs.urllib.request, "urlopen", side_effect=fake_urlopen):
+            cs._api_chat_completions("SYS", "PROMPT", [], "M", {})
+        self.assertNotIn("tools", captured["body"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

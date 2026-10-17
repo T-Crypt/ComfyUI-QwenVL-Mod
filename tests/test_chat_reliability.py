@@ -31,6 +31,7 @@ PACK_ROOT = Path(__file__).parents[1]
 CHAT_ROUTES = {
     ("POST", "/qwenvl/chat"): "_chat",
     ("GET", "/qwenvl/chat/models"): "_chat_models",
+    ("GET", "/qwenvl/chat/tools"): "_chat_tools",
     ("GET", "/qwenvl/chat/assets"): "_chat_assets",
 }
 
@@ -372,6 +373,38 @@ class ColdLoadRetryTests(unittest.TestCase):
         self.assertFalse(_api_retryable(400, "bad request"))
         self.assertFalse(_api_retryable(500, "disk full"))
         self.assertTrue(_api_retryable(500, "Upstream command exited prematurely"))
+
+
+class ApiModelListTests(unittest.TestCase):
+    """The selector list comes from llama-swap, keeps the default first, and
+    never blanks when llama-swap is down."""
+
+    def setUp(self):
+        from chat_service import _api_models_cache
+        _api_models_cache.update(at=0.0, names=[])
+
+    def test_default_is_first_and_embeddings_are_dropped(self):
+        payload = {"data": [{"id": "ZZZ"}, {"id": "NInfer-HauHauCS-27B"},
+                            {"id": "text-embedding-nomic-embed-text-v1.5"}]}
+        from chat_service import _api_models
+        with patch("urllib.request.urlopen", return_value=_json_response(payload)):
+            names = _api_models()
+        self.assertEqual(names[0], "NInfer-HauHauCS-27B")
+        self.assertIn("ZZZ", names)
+        self.assertNotIn("text-embedding-nomic-embed-text-v1.5", names)
+
+    def test_falls_back_to_the_default_when_llama_swap_is_down(self):
+        from chat_service import _api_models, API_DEFAULT_MODEL
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+            names = _api_models()
+        self.assertEqual(names, [API_DEFAULT_MODEL])
+
+    def test_cache_avoids_a_second_socket_call(self):
+        from chat_service import _api_models
+        with patch("urllib.request.urlopen", return_value=_json_response({"data": [{"id": "ZZZ"}]})) as urlopen:
+            _api_models()
+            _api_models()
+        self.assertEqual(urlopen.call_count, 1)
 
 
 if __name__ == "__main__":
