@@ -1,11 +1,15 @@
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
+
+import chat_service as _cs
 
 from chat_service import (
     ChatRuntime,
@@ -31,6 +35,65 @@ from chat_service import (
     ensure_i2va_binding,
     normalize_minimax_output,
 )
+
+
+def setUpModule():
+    # Keep the offline suite offline: an api chat turn would otherwise fetch
+    # /object_info on every build_prompt call. NodeTypesContextTests resets and
+    # restores this stub around its own mocked fetch.
+    _cs._nodetypes_cache.update(at=time.time(), text="INSTALLED NODES (stubbed for the offline suite)")
+
+
+def tearDownModule():
+    _cs._nodetypes_cache.update(at=0.0, text="")
+
+
+class NodeTypesContextTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(_cs._nodetypes_cache)
+        _cs._nodetypes_cache.update(at=0.0, text="")
+
+    def tearDown(self):
+        _cs._nodetypes_cache.update(**self.saved)
+
+    def test_lists_installed_node_classes(self):
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps({"KSampler": {}, "CLIPTextEncode": {}}).encode()
+
+        with unittest.mock.patch.object(_cs.urllib.request, "urlopen", return_value=_Resp()):
+            text = _cs.node_types_context()
+        self.assertIn("KSampler", text)
+        self.assertIn("CLIPTextEncode", text)
+
+    def test_returns_empty_when_object_info_is_unavailable(self):
+        with unittest.mock.patch.object(_cs.urllib.request, "urlopen", side_effect=OSError("down")):
+            self.assertEqual(_cs.node_types_context(), "")
+
+    def test_build_prompt_includes_nodes_only_when_asked(self):
+        with unittest.mock.patch.object(_cs, "node_types_context", return_value="ZZ_NODES_SENTINEL_ZZ KSampler"):
+            with_nodes = _cs.build_prompt([{"role": "user", "content": "x"}], {"nodes": []}, include_nodes=True)
+            without_nodes = _cs.build_prompt([{"role": "user", "content": "x"}], {"nodes": []})
+        self.assertIn("ZZ_NODES_SENTINEL_ZZ", with_nodes)
+        self.assertNotIn("ZZ_NODES_SENTINEL_ZZ", without_nodes)
+
+    def test_catalog_reports_nodes_and_models(self):
+        saved = dict(_cs._nodetypes_cache)
+        _cs._nodetypes_cache.update(at=0.0, text="")
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps({"KSampler": {}}).encode()
+
+        try:
+            with unittest.mock.patch.object(_cs.urllib.request, "urlopen", return_value=_Resp()):
+                data = _cs.catalog()
+        finally:
+            _cs._nodetypes_cache.update(**saved)
+        self.assertIn("KSampler", data["nodes"])
+        self.assertIsInstance(data["models"], str)
 
 
 class ChatProtocolTests(unittest.TestCase):
@@ -404,7 +467,7 @@ class ChatProtocolTests(unittest.TestCase):
 
             def generate(self, *args, **kwargs):
                 self.kwargs = kwargs
-                self.frame_count = args[3]
+                self.frame_count = args[4]
                 return '{"message":"ok","actions":[]}'
 
         previous = sys.modules.get("AILab_QwenVL")
@@ -910,6 +973,140 @@ class ChatProtocolTests(unittest.TestCase):
         self.assertFalse(result["parsed"])
         self.assertEqual(result["actions"], [])
         self.assertEqual(len(calls), 3)
+
+class AgentToolRegistryTests(unittest.TestCase):
+    """The tool registry is one source of truth for the schemas, the prompt and
+    validate_actions, and for translating OpenAI tool calls into actions."""
+
+    def test_tool_schemas_are_valid_openai_functions(self):
+        from chat_service import TOOLS, TOOL_SCHEMAS
+        self.assertEqual(len(TOOL_SCHEMAS), len(TOOLS))
+        seen = set()
+        for schema in TOOL_SCHEMAS:
+            with self.subTest(tool=schema["function"]["name"]):
+                self.assertEqual(schema["type"], "function")
+                function = schema["function"]
+                self.assertTrue(function["name"])
+                self.assertNotIn(function["name"], seen)
+                seen.add(function["name"])
+                self.assertTrue(function["description"])
+                params = function["parameters"]
+                self.assertEqual(params["type"], "object")
+                self.assertIsInstance(params["properties"], dict)
+                self.assertIsInstance(params["required"], list)
+                self.assertFalse(params["additionalProperties"])
+
+    def test_prompt_names_every_tool_and_the_list_is_filled(self):
+        from chat_service import BASE_SYSTEM_PROMPT, TOOLS
+        self.assertNotIn("[[TOOL_LIST]]", BASE_SYSTEM_PROMPT)
+        for tool in TOOLS:
+            with self.subTest(tool=tool["name"]):
+                self.assertIn(tool["name"], BASE_SYSTEM_PROMPT)
+
+    def test_unknown_or_unhashable_action_type_is_dropped(self):
+        self.assertEqual(validate_actions([{"type": "nonsense"}]), [])
+        self.assertEqual(validate_actions([{"type": ["set_widget_value"]}]), [])
+        self.assertEqual(validate_actions([{"type": "layout"}]), [{"type": "layout"}])
+
+    def test_tool_calls_fold_into_canonical_actions(self):
+        import chat_service as cs
+        text = cs._tool_calls_to_json("done", [
+            {"function": {"name": "set_widget_value",
+                          "arguments": '{"node_id": 12, "widget": "steps", "value": 20}'}},
+            {"function": {"name": "queue_workflow", "arguments": "{}"}},
+        ])
+        result = parse_model_response(text)
+        self.assertTrue(result["parsed"])
+        self.assertEqual(result["message"], "done")
+        self.assertEqual(result["actions"], [
+            {"type": "set_widget_value", "node_id": 12, "widget": "steps", "value": 20},
+            {"type": "queue_workflow"},
+        ])
+
+    def test_tool_calls_with_bad_arguments_drop_the_action(self):
+        import chat_service as cs
+        text = cs._tool_calls_to_json("", [
+            {"function": {"name": "connect", "arguments": "not json"}},
+            {"function": {"name": "set_widget_value", "arguments": '{"node_id": 1}'}},
+        ])
+        result = parse_model_response(text)
+        self.assertTrue(result["parsed"])
+        self.assertEqual(result["actions"], [])
+
+    def test_api_reply_tool_calls_become_actions(self):
+        import json as _json
+        from unittest import mock
+        import chat_service as cs
+
+        payload = {"choices": [{"finish_reason": "tool_calls", "message": {
+            "content": "",
+            "tool_calls": [{"function": {"name": "queue_workflow", "arguments": "{}"}}],
+        }}]}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return _json.dumps(payload).encode()
+
+        with mock.patch.object(cs.urllib.request, "urlopen", return_value=_Resp()):
+            text, finish = cs._api_chat_completions("SYS", "PROMPT", [], "M", {}, cs.TOOL_SCHEMAS)
+        self.assertEqual(finish, "tool_calls")
+        result = cs.parse_model_response(text)
+        self.assertEqual(result["actions"], [{"type": "queue_workflow"}])
+
+    def test_tools_reach_the_llama_swap_payload_only_when_set(self):
+        import json as _json
+        from unittest import mock
+        import chat_service as cs
+
+        captured = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return _json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode()
+
+        def fake_urlopen(request, timeout=None):
+            captured["body"] = _json.loads(request.data.decode("utf-8"))
+            return _Resp()
+
+        with mock.patch.object(cs.urllib.request, "urlopen", side_effect=fake_urlopen):
+            cs._api_chat_completions("SYS", "PROMPT", [], "M", {},
+                                     [{"type": "function", "function": {"name": "layout"}}])
+        self.assertEqual(captured["body"]["tools"][0]["function"]["name"], "layout")
+        self.assertEqual(captured["body"]["tool_choice"], "auto")
+
+        with mock.patch.object(cs.urllib.request, "urlopen", side_effect=fake_urlopen):
+            cs._api_chat_completions("SYS", "PROMPT", [], "M", {})
+        self.assertNotIn("tools", captured["body"])
+
+
+    def test_accepts_catalog_tools(self):
+        self.assertEqual(
+            validate_actions([{"type": "list_nodes"}, {"type": "list_models"}]),
+            [{"type": "list_nodes"}, {"type": "list_models"}])
+
+    def test_rejects_malformed_rename_and_suggest(self):
+        self.assertEqual(validate_actions([
+            {"type": "workflow_rename", "name": "a/b", "new_name": "ok"},
+            {"type": "workflow_rename", "name": "ok"},
+            {"type": "suggest_workflow", "summary": "", "steps": [{"key": "k", "node_type": "N"}]},
+            {"type": "suggest_workflow", "summary": "x", "steps": []},
+            {"type": "suggest_workflow", "summary": "x", "steps": [{"key": "k"}]},
+        ]), [])
+
+    def test_accepts_workflow_rename_and_suggest(self):
+        actions = validate_actions([
+            {"type": "workflow_rename", "name": "old one", "new_name": "new one.json"},
+            {"type": "suggest_workflow", "summary": "A portrait graph",
+             "steps": [{"key": "k1", "node_type": "KSampler", "widgets": {"steps": 20}},
+                       {"key": "k2", "node_type": "VAEDecode"}],
+             "links": [{"from": "k1", "out": "LATENT", "to": "k2", "in": "samples"}]},
+        ])
+        self.assertEqual(actions[0], {"type": "workflow_rename", "name": "old one", "new_name": "new one"})
+        self.assertEqual(actions[1]["steps"][0], {"key": "k1", "node_type": "KSampler", "widgets": {"steps": 20}})
+        self.assertEqual(actions[1]["links"][0], {"from": "k1", "out": "LATENT", "to": "k2", "in": "samples"})
+
 
 if __name__ == "__main__":
     unittest.main()

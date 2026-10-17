@@ -8,6 +8,9 @@ const DEFAULT_API_MODEL = "NInfer-HauHauCS-27B";
 const GGUF_PREFIX = "GGUF: ";
 const HF_PREFIX = "HF: ";
 const API_PREFIX = "API: ";
+// Bound the chat POST just above the server's API_TIMEOUT_S (600s): a stalled
+// generation still ends, and the Stop button aborts through AbortController.
+const CHAT_TIMEOUT_MS = 640000;
 const modelBackend = () => (state.model || "").startsWith(HF_PREFIX) ? "hf" : (state.model || "").startsWith(API_PREFIX) ? "api" : "gguf";
 const bareModel = () => (state.model || "").replace(/^(GGUF|HF|API): /, "");
 const TRANSLATIONS = {
@@ -26,6 +29,9 @@ const TRANSLATIONS = {
         newConversation: "New conversation", placeholder: "Example: set 25 steps in KSampler and run the workflow",
         unloadError: "Unable to unload the chat model from memory", workflowQueued: "workflow added to the queue",
         selfCorrecting: "Self-correcting…",
+        generating: "Generating…", generatingPaused: "Generating, chat paused until the GPU is free",
+        loadingModel: "Loading the chat model…", building: "Building the workflow…",
+        planTitle: "Proposed workflow", planBuild: "Build it",
         invalidNumber: "{widget}: invalid numeric value", invalidBoolean: "{widget}: invalid boolean value",
         unavailableOption: "{widget}: option is not available", invalidText: "{widget}: invalid text value",
         missingNode: "node {node} does not exist", missingWidget: "widget {widget} does not exist on node {node}",
@@ -53,6 +59,9 @@ const TRANSLATIONS = {
         newConversation: "Nuova conversazione", placeholder: "Es: imposta 25 step nel KSampler e avvia il workflow",
         unloadError: "Impossibile scaricare il modello chat dalla memoria", workflowQueued: "workflow aggiunto alla coda",
         selfCorrecting: "Autocorrezione…",
+        generating: "Generazione…", generatingPaused: "Generazione in corso, chat in pausa finché la GPU è libera",
+        loadingModel: "Caricamento del modello chat…", building: "Creazione del workflow…",
+        planTitle: "Workflow proposto", planBuild: "Crealo",
         invalidNumber: "{widget}: valore numerico non valido", invalidBoolean: "{widget}: valore booleano non valido",
         unavailableOption: "{widget}: opzione non disponibile", invalidText: "{widget}: valore testuale non valido",
         missingNode: "nodo {node} inesistente", missingWidget: "widget {widget} inesistente nel nodo {node}",
@@ -83,6 +92,11 @@ let controller = null;
 let elements = {};
 let attachedImage = null;
 let attachedVideo = null;
+let statusTimer = null;
+let highlightTimer = null;
+let activePromptId = null;
+const queuedJobs = new Map(); // prompt_id -> the chat message that shows the results
+const highlightedNodes = new Map(); // node -> its previous boxcolor
 
 // ---- Wildcard autocomplete (ComfyUI-TagForge) ----
 const WILDCARD_LIST_URL = "/jupo/TagForge/tagcomplete/wildcards/list";
@@ -159,13 +173,21 @@ function validStoredMessage(message) {
     return message && (message.role === "user" || message.role === "assistant") && typeof message.content === "string" && message.content.trim();
 }
 
+function newSessionId() {
+    try {
+        return crypto.randomUUID();
+    } catch {
+        return `s-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+}
+
 function loadState() {
     try {
         const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
         const messages = Array.isArray(saved?.messages) ? saved.messages.filter(validStoredMessage).slice(-20) : [];
-        return { ...DEFAULT_STATE, ...(saved || {}), messages };
+        return { ...DEFAULT_STATE, ...(saved || {}), messages, sessionId: saved?.sessionId || newSessionId() };
     } catch {
-        return { ...DEFAULT_STATE };
+        return { ...DEFAULT_STATE, sessionId: newSessionId() };
     }
 }
 
@@ -184,6 +206,214 @@ function setStatus(text, error = false) {
     if (!elements.status) return;
     elements.status.textContent = text;
     elements.status.classList.toggle("error", error);
+}
+
+async function parseJsonResponse(response) {
+    // llama-swap and proxies can answer with HTML on a failure: read the text
+    // first so the caller can check response.ok before trusting the body.
+    try {
+        const text = await response.text();
+        return text ? JSON.parse(text) : {};
+    } catch {
+        return {};
+    }
+}
+
+function highlightNode(node) {
+    if (!node || highlightedNodes.has(node)) return;
+    highlightedNodes.set(node, node.boxcolor ?? null);
+    node.boxcolor = "#6d7cff";
+    node.setDirtyCanvas?.(true, true);
+}
+
+function clearHighlights() {
+    for (const [node, boxcolor] of highlightedNodes) {
+        node.boxcolor = boxcolor;
+        node.setDirtyCanvas?.(true, true);
+    }
+    highlightedNodes.clear();
+}
+
+function clearHighlightsSoon() {
+    if (highlightTimer) clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(clearHighlights, 1800);
+}
+
+function resultImageUrl(image) {
+    const params = new URLSearchParams({
+        filename: image.filename,
+        subfolder: image.subfolder || "",
+        type: image.type || "output",
+    });
+    return api.apiURL(`/view?${params.toString()}`);
+}
+
+async function mirrorSession() {
+    try {
+        await api.fetchApi("/qwenvl/chat/session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: state.sessionId, messages: state.messages.slice(-20), model: bareModel() }),
+        });
+    } catch { /* the browser copy is the source of truth */ }
+}
+
+async function restoreSession() {
+    if (state.messages.length) return;
+    try {
+        const response = await api.fetchApi(`/qwenvl/chat/session?session_id=${encodeURIComponent(state.sessionId)}`);
+        if (!response.ok) return;
+        const data = await parseJsonResponse(response);
+        const messages = Array.isArray(data.messages) ? data.messages.filter(validStoredMessage) : [];
+        if (messages.length) {
+            state.messages = messages.slice(-20);
+            saveState();
+            renderMessages();
+        }
+    } catch { /* the server copy is optional */ }
+}
+
+async function pollStatus() {
+    if (!controller) return;
+    try {
+        const response = await api.fetchApi("/qwenvl/chat/status");
+        if (!response.ok) return;
+        const status = await parseJsonResponse(response);
+        if (status.free_error) {
+            setStatus(status.free_error, true);
+        } else if (status.state === "generating") {
+            setStatus(t("generatingPaused"));
+        } else if (status.state === "loading") {
+            setStatus(t("loadingModel"));
+        }
+    } catch { /* status is best effort */ }
+}
+
+async function unloadChatModel() {
+    const response = await api.fetchApi("/qwenvl/chat/unload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backend: modelBackend(), model: bareModel() }),
+    });
+    if (!response.ok) throw new Error(t("unloadError"));
+}
+
+async function queueGraph() {
+    // Free the shared card first (the chat model lives in llama-swap), then POST
+    // the API-format prompt and follow it over the websocket.
+    await unloadChatModel();
+    const { output } = await app.graphToPrompt();
+    const response = await api.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: output, client_id: api.clientId }),
+    });
+    const data = await parseJsonResponse(response);
+    if (!response.ok) {
+        const detail = data?.error?.message || data?.error || data?.node_errors;
+        throw new Error(`queue failed: ${typeof detail === "string" ? detail : JSON.stringify(detail ?? response.status)}`);
+    }
+    return data.prompt_id || null;
+}
+
+let catalogCache = null;
+
+function onExecuted(event) {
+    const detail = event?.detail || {};
+    const promptId = detail.prompt_id;
+    const images = detail.output?.images;
+    if (!promptId || !Array.isArray(images) || !images.length) return;
+    const message = queuedJobs.get(String(promptId));
+    if (!message) return;
+    message.images = (message.images || []).concat(images);
+    saveState();
+    renderMessages();
+}
+
+function onProgress(event) {
+    const detail = event?.detail || {};
+    if (!activePromptId || String(detail.prompt_id) !== String(activePromptId)) return;
+    if (detail.max > 0) setStatus(`${t("generating")} ${Math.round((100 * detail.value) / detail.max)}%`);
+}
+
+function onExecuting(event) {
+    const detail = event?.detail || {};
+    if (!activePromptId || String(detail.prompt_id) !== String(activePromptId)) return;
+    if (detail.node) setStatus(t("generating"));
+}
+
+function onExecutionError(event) {
+    const detail = event?.detail || {};
+    if (!activePromptId || String(detail.prompt_id) !== String(activePromptId)) return;
+    setStatus(`${detail.exception_type || "error"}: ${detail.exception_message || ""}`.slice(0, 300), true);
+}
+
+async function runCatalog(kind) {
+    if (!catalogCache) {
+        const response = await api.fetchApi("/qwenvl/chat/catalog");
+        const data = await parseJsonResponse(response);
+        if (!response.ok) throw new Error(`catalog failed: HTTP ${response.status}`);
+        catalogCache = data;
+    }
+    const text = catalogCache[kind];
+    if (typeof text === "string" && text) return text;
+    return kind === "nodes" ? "the server returned no node list" : "no model files found";
+}
+
+function planToActions(plan) {
+    const actions = [];
+    for (const step of plan.steps || []) {
+        actions.push({ type: "add_node", key: step.key, node_type: step.node_type, title: step.title });
+        for (const [name, value] of Object.entries(step.widgets || {})) {
+            actions.push({ type: "set_widget_value", node_id: step.key, widget: name, value });
+        }
+    }
+    for (const link of plan.links || []) {
+        actions.push({ type: "connect", from: link.from, out: link.out, to: link.to, in: link.in });
+    }
+    actions.push({ type: "layout" });
+    return actions;
+}
+
+function renderPlan(message) {
+    const plan = message.plan;
+    const card = createElement("div", "qwen-chat-plan");
+    card.append(createElement("div", "qwen-chat-plan-title", plan.title || t("planTitle")));
+    card.append(createElement("div", "qwen-chat-plan-summary", plan.summary));
+    const nodes = createElement("ul", "qwen-chat-plan-nodes");
+    for (const step of plan.steps || []) nodes.append(createElement("li", "", `${step.node_type} (${step.key})`));
+    card.append(nodes);
+    if ((plan.links || []).length) {
+        const links = createElement("ul", "qwen-chat-plan-links");
+        for (const link of plan.links) links.append(createElement("li", "", `${link.from}:${link.out} → ${link.to}:${link.in}`));
+        card.append(links);
+    }
+    const build = createElement("button", "qwen-chat-plan-build", t("planBuild"));
+    build.type = "button";
+    build.addEventListener("click", () => buildPlan(message));
+    card.append(build);
+    return card;
+}
+
+async function buildPlan(message) {
+    const plan = message.plan;
+    if (!plan || controller) return;
+    controller = new AbortController();
+    setBusy(true);
+    setStatus(t("building"));
+    try {
+        const result = await applyActions(planToActions(plan));
+        message.plan = null;
+        message.content = `${message.content}\n\n${formatAnswer(t("completed"), result.applied, result.rejected)}`;
+        saveState();
+        renderMessages();
+        setStatus(t("ready"));
+    } catch (error) {
+        setStatus(error.message || String(error), true);
+    } finally {
+        controller = null;
+        setBusy(false);
+    }
 }
 
 function renderMessages() {
@@ -217,6 +447,25 @@ function renderMessages() {
             const pre = createElement("pre", "", message.thinking);
             details.append(pre);
             row.append(details);
+        }
+        if (message.plan) {
+            row.append(renderPlan(message));
+        }
+        if (Array.isArray(message.images) && message.images.length) {
+            const gallery = createElement("div", "qwen-chat-result-images");
+            for (const image of message.images) {
+                const link = createElement("a", "qwen-chat-result-image");
+                link.href = resultImageUrl(image);
+                link.target = "_blank";
+                link.rel = "noreferrer";
+                const img = createElement("img");
+                img.src = resultImageUrl(image);
+                img.alt = image.filename || "result";
+                img.loading = "lazy";
+                link.append(img);
+                gallery.append(link);
+            }
+            row.append(gallery);
         }
         elements.messages.append(row);
     }
@@ -690,7 +939,7 @@ async function runModelSearch(action) {
     const params = new URLSearchParams({ q: action.query, limit: "8" });
     if (action.types) params.set("types", action.types);
     const response = await api.fetchApi(`/qwenvl/models/search?${params.toString()}`);
-    const data = await response.json();
+    const data = await parseJsonResponse(response);
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     const items = Array.isArray(data.items) ? data.items.slice(0, 8) : [];
     if (!items.length) return `search "${action.query}" returned no results`;
@@ -716,7 +965,7 @@ async function runModelDownload(action) {
             token: state.civitaiKey || undefined,
         }),
     });
-    const data = await response.json();
+    const data = await parseJsonResponse(response);
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     return `downloaded ${data.filename} (${Math.round((data.bytes || 0) / 1048576)}MB) as ${data.kind} — use exactly '${data.filename}' in widgets`;
 }
@@ -847,172 +1096,242 @@ async function runWorkflowDelete(action) {
     return `deleted '${base}' from the workflow library`;
 }
 
+async function runWorkflowRename(action) {
+    // Create the new file first, then remove the old one: a failure between the
+    // two leaves a copy, never a hole.
+    const base = sanitizeWorkflowName(action.name);
+    const next = sanitizeWorkflowName(action.new_name);
+    if (!base || !next) throw new Error("workflow name is empty after sanitizing");
+    const source = `/userdata/${encodeURIComponent(`workflows/${base}.json`)}`;
+    const response = await api.fetchApi(source, { timeoutMs: null });
+    if (response.status === 404) throw new Error(`no saved workflow '${base}' (nothing renamed)`);
+    if (!response.ok) throw new Error(`workflow rename failed: HTTP ${response.status}`);
+    const data = await parseJsonResponse(response);
+    const saved = await api.fetchApi(`/userdata/${encodeURIComponent(`workflows/${next}.json`)}?overwrite=false`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        timeoutMs: null,
+        signal: controller?.signal,
+        body: JSON.stringify(data),
+    });
+    if (saved.status === 409) throw new Error(`a workflow named '${next}' already exists`);
+    if (!saved.ok) throw new Error(`workflow rename failed: HTTP ${saved.status}`);
+    const removed = await api.fetchApi(source, { method: "DELETE" });
+    if (!removed.ok) throw new Error(`renamed to '${next}' but could not remove the old '${base}'`);
+    return `renamed '${base}' to '${next}'`;
+}
+
 async function applyActions(actions) {
     const applied = [];
     const rejected = [];
     const observations = [];
     let shouldQueue = false;
     let queued = false;
+    let plan = null;
     const keyToId = new Map();
     const resolveNode = (ref) => {
         const mapped = keyToId.get(String(ref));
         return findNode(mapped !== undefined ? mapped : ref);
     };
-    for (const action of Array.isArray(actions) ? actions : []) {
-        if (action.type === "queue_workflow") {
-            shouldQueue = true;
-            continue;
-        }
-        if (action.type === "layout") {
+    // One undo step per agent turn: open the change tracker before the first
+    // graph mutation and close it after the last, so Ctrl+Z reverts the whole
+    // turn. Touched nodes get a temporary boxcolor that fades after the turn.
+    let changeOpen = false;
+    const beginChange = () => {
+        if (changeOpen) return;
+        try { app.canvas?.emitBeforeChange?.(); } catch { /* no tracker */ }
+        changeOpen = true;
+    };
+    const endChange = () => {
+        if (!changeOpen) return;
+        changeOpen = false;
+        try { app.canvas?.emitAfterChange?.(); } catch { /* no tracker */ }
+    };
+    try {
+        for (const action of Array.isArray(actions) ? actions : []) {
+            if (action.type === "queue_workflow") {
+                shouldQueue = true;
+                continue;
+            }
+            if (action.type === "layout") {
+                try {
+                    beginChange();
+                    const moved = layoutGraph();
+                    applied.push(`organized ${moved} node(s) into columns`);
+                } catch (error) {
+                    rejected.push(error.message || String(error));
+                }
+                continue;
+            }
             try {
-                const moved = layoutGraph();
-                applied.push(`organized ${moved} node(s) into columns`);
+                if (action.type === "add_node") {
+                    const LG = liteGraph();
+                    if (!LG || typeof LG.createNode !== "function") throw new Error("structural edit unavailable: LiteGraph API not found");
+                    if (keyToId.has(String(action.key))) throw new Error(`key ${action.key} is already used in this response`);
+                    if (!LG.registered_node_types || !LG.registered_node_types[action.node_type]) throw new Error(`unknown node type ${action.node_type}`);
+                    const node = LG.createNode(action.node_type);
+                    if (!node) throw new Error(`could not create ${action.node_type}`);
+                    if (typeof action.title === "string" && action.title) {
+                        try { node.title = action.title; } catch { /* keep default title */ }
+                    }
+                    const [px, py] = (typeof action.x === "number" && typeof action.y === "number")
+                        ? [action.x, action.y] : autoPlaceNode();
+                    try {
+                        if (Array.isArray(node.pos)) { node.pos[0] = px; node.pos[1] = py; }
+                        else node.pos = [px, py];
+                    } catch { /* keep default position */ }
+                    beginChange();
+                    app.graph.add(node);
+                    keyToId.set(String(action.key), node.id);
+                    highlightNode(node);
+                    applied.push(`node ${node.id}: added ${action.node_type} as ${action.key}`);
+                } else if (action.type === "remove_node") {
+                    const node = resolveNode(action.node_id);
+                    if (!node) throw new Error(t("missingNode", { node: action.node_id }));
+                    const realId = node.id;
+                    beginChange();
+                    app.graph.remove(node);
+                    for (const [key, value] of keyToId) {
+                        if (String(value) === String(realId) || key === String(action.node_id)) keyToId.delete(key);
+                    }
+                    applied.push(`node ${realId}: removed`);
+                } else if (action.type === "connect") {
+                    const fromNode = resolveNode(action.from);
+                    const toNode = resolveNode(action.to);
+                    if (!fromNode) throw new Error(t("missingNode", { node: action.from }));
+                    if (!toNode) throw new Error(t("missingNode", { node: action.to }));
+                    const outIndex = resolveSlotIndex(fromNode, "output", action.out);
+                    const inIndex = resolveSlotIndex(toNode, "input", action.in);
+                    if (outIndex < 0) throw new Error(`output ${action.out} does not exist on node ${action.from}`);
+                    if (inIndex < 0) throw new Error(`input ${action.in} does not exist on node ${action.to}`);
+                    const target = (toNode.inputs || [])[inIndex];
+                    if (target && target.link != null) throw new Error(`input ${action.in} on node ${action.to} is already connected — disconnect it first`);
+                    const outType = (fromNode.outputs || [])[outIndex]?.type;
+                    if (!slotsCompatible(outType, target?.type)) throw new Error(`type mismatch: ${outType} cannot feed ${target?.type}`);
+                    beginChange();
+                    fromNode.connect(outIndex, toNode, inIndex);
+                    highlightNode(fromNode);
+                    highlightNode(toNode);
+                    applied.push(`linked ${action.from}:${action.out} → ${action.to}:${action.in}`);
+                } else if (action.type === "disconnect") {
+                    const node = resolveNode(action.node_id);
+                    if (!node) throw new Error(t("missingNode", { node: action.node_id }));
+                    const inIndex = resolveSlotIndex(node, "input", action.input);
+                    if (inIndex < 0) throw new Error(`input ${action.input} does not exist on node ${action.node_id}`);
+                    const target = (node.inputs || [])[inIndex];
+                    if (!target || target.link == null) {
+                        applied.push(`node ${action.node_id}: input ${action.input} already empty`);
+                    } else {
+                        beginChange();
+                        node.disconnectInput(inIndex);
+                        highlightNode(node);
+                        applied.push(`node ${action.node_id}: disconnected input ${action.input}`);
+                    }
+                } else if (action.type === "list_nodes" || action.type === "list_models") {
+                    const kind = action.type === "list_nodes" ? "nodes" : "models";
+                    const text = await runCatalog(kind);
+                    applied.push(kind === "nodes" ? "listed installed nodes" : "listed installed models");
+                    observations.push(text.slice(0, 8000));
+                } else if (action.type === "search_models") {
+                    const text = await runModelSearch(action);
+                    applied.push(`searched CivitAI for "${action.query}"`);
+                    observations.push(text.slice(0, 3000));
+                } else if (action.type === "download_model") {
+                    const text = await runModelDownload(action);
+                    applied.push(`downloaded model (${action.kind})`);
+                    observations.push(text.slice(0, 1000));
+                } else if (action.type === "queue_status") {
+                    const text = await runQueueStatus();
+                    applied.push("checked the queue");
+                    observations.push(text.slice(0, 800));
+                } else if (action.type === "queue_cancel") {
+                    const text = await runQueueCancel(action);
+                    applied.push(`cancelled (${action.scope})`);
+                    observations.push(text.slice(0, 400));
+                } else if (action.type === "workflow_list") {
+                    const text = await runWorkflowList();
+                    applied.push("listed saved workflows");
+                    observations.push(text.slice(0, 2000));
+                } else if (action.type === "workflow_save") {
+                    const text = await runWorkflowSave(action);
+                    applied.push(text.slice(0, 200));
+                } else if (action.type === "workflow_load") {
+                    const text = await runWorkflowLoad(action);
+                    applied.push(text.slice(0, 200));
+                    observations.push(text.slice(0, 400));
+                } else if (action.type === "workflow_rename") {
+                    const text = await runWorkflowRename(action);
+                    applied.push(text.slice(0, 200));
+                } else if (action.type === "workflow_delete") {
+                    const text = await runWorkflowDelete(action);
+                    applied.push(text.slice(0, 200));
+                } else if (action.type === "suggest_workflow") {
+                    plan = action;
+                    applied.push(`proposed "${action.title || action.summary}"`);
+                    observations.push(
+                        `PRESENTED TO USER (not built yet): ${action.summary}\n`
+                        + `nodes: ${(action.steps || []).map((step) => `${step.node_type}(${step.key})`).join(", ")}\n`
+                        + "The user sees a preview with a Build button. Wait for them to ask to build or adjust it."
+                    );
+                } else if (action.type === "clear_graph") {
+                    const count = (app.graph?._nodes || []).length;
+                    beginChange();
+                    app.graph.clear();
+                    applied.push(`cleared ${count} node(s)`);
+                } else if (action.type === "set_widget_value") {
+                    const node = resolveNode(action.node_id);
+                    if (!node) {
+                        rejected.push(t("missingNode", { node: action.node_id }));
+                        continue;
+                    }
+                    const widget = (node.widgets || []).find((item) => item.name === action.widget);
+                    if (!widget) {
+                        rejected.push(t("missingWidget", { widget: action.widget, node: action.node_id }));
+                        continue;
+                    }
+                    try {
+                        const value = normalizeWidgetValue(widget, action.value);
+                        const previousValue = widget.value;
+                        beginChange();
+                        widget.value = value;
+                        widget.callback?.(value, app.canvas, node);
+                        node.onWidgetChanged?.(widget.name, value, previousValue, widget);
+                        node.setDirtyCanvas?.(true, true);
+                        highlightNode(node);
+                        applied.push(t("nodeValue", { node: action.node_id, widget: widget.name, value: String(value).slice(0, 120) }));
+                    } catch (error) {
+                        rejected.push(error.message);
+                    }
+                } else if (action.type === "set_node_mode" && ["bypass", "enable"].includes(action.mode)) {
+                    const node = resolveNode(action.node_id);
+                    if (!node) {
+                        rejected.push(t("missingNode", { node: action.node_id }));
+                        continue;
+                    }
+                    beginChange();
+                    node.mode = action.mode === "bypass" ? 4 : 0;
+                    node.setDirtyCanvas?.(true, true);
+                    highlightNode(node);
+                    applied.push(t("nodeMode", { node: action.node_id, mode: action.mode }));
+                } else {
+                    rejected.push(t("unsupportedAction", { action: action.type || t("unknown") }));
+                }
             } catch (error) {
                 rejected.push(error.message || String(error));
             }
-            continue;
         }
-        try {
-            if (action.type === "add_node") {
-                const LG = liteGraph();
-                if (!LG || typeof LG.createNode !== "function") throw new Error("structural edit unavailable: LiteGraph API not found");
-                if (keyToId.has(String(action.key))) throw new Error(`key ${action.key} is already used in this response`);
-                if (!LG.registered_node_types || !LG.registered_node_types[action.node_type]) throw new Error(`unknown node type ${action.node_type}`);
-                const node = LG.createNode(action.node_type);
-                if (!node) throw new Error(`could not create ${action.node_type}`);
-                if (typeof action.title === "string" && action.title) {
-                    try { node.title = action.title; } catch { /* keep default title */ }
-                }
-                const [px, py] = (typeof action.x === "number" && typeof action.y === "number")
-                    ? [action.x, action.y] : autoPlaceNode();
-                try {
-                    if (Array.isArray(node.pos)) { node.pos[0] = px; node.pos[1] = py; }
-                    else node.pos = [px, py];
-                } catch { /* keep default position */ }
-                app.graph.add(node);
-                keyToId.set(String(action.key), node.id);
-                applied.push(`node ${node.id}: added ${action.node_type} as ${action.key}`);
-            } else if (action.type === "remove_node") {
-                const node = resolveNode(action.node_id);
-                if (!node) throw new Error(t("missingNode", { node: action.node_id }));
-                const realId = node.id;
-                app.graph.remove(node);
-                for (const [key, value] of keyToId) {
-                    if (String(value) === String(realId) || key === String(action.node_id)) keyToId.delete(key);
-                }
-                applied.push(`node ${realId}: removed`);
-            } else if (action.type === "connect") {
-                const fromNode = resolveNode(action.from);
-                const toNode = resolveNode(action.to);
-                if (!fromNode) throw new Error(t("missingNode", { node: action.from }));
-                if (!toNode) throw new Error(t("missingNode", { node: action.to }));
-                const outIndex = resolveSlotIndex(fromNode, "output", action.out);
-                const inIndex = resolveSlotIndex(toNode, "input", action.in);
-                if (outIndex < 0) throw new Error(`output ${action.out} does not exist on node ${action.from}`);
-                if (inIndex < 0) throw new Error(`input ${action.in} does not exist on node ${action.to}`);
-                const target = (toNode.inputs || [])[inIndex];
-                if (target && target.link != null) throw new Error(`input ${action.in} on node ${action.to} is already connected — disconnect it first`);
-                const outType = (fromNode.outputs || [])[outIndex]?.type;
-                if (!slotsCompatible(outType, target?.type)) throw new Error(`type mismatch: ${outType} cannot feed ${target?.type}`);
-                fromNode.connect(outIndex, toNode, inIndex);
-                applied.push(`linked ${action.from}:${action.out} → ${action.to}:${action.in}`);
-            } else if (action.type === "disconnect") {
-                const node = resolveNode(action.node_id);
-                if (!node) throw new Error(t("missingNode", { node: action.node_id }));
-                const inIndex = resolveSlotIndex(node, "input", action.input);
-                if (inIndex < 0) throw new Error(`input ${action.input} does not exist on node ${action.node_id}`);
-                const target = (node.inputs || [])[inIndex];
-                if (!target || target.link == null) {
-                    applied.push(`node ${action.node_id}: input ${action.input} already empty`);
-                } else {
-                    node.disconnectInput(inIndex);
-                    applied.push(`node ${action.node_id}: disconnected input ${action.input}`);
-                }
-            } else if (action.type === "search_models") {
-                const text = await runModelSearch(action);
-                applied.push(`searched CivitAI for "${action.query}"`);
-                observations.push(text.slice(0, 3000));
-            } else if (action.type === "download_model") {
-                const text = await runModelDownload(action);
-                applied.push(`downloaded model (${action.kind})`);
-                observations.push(text.slice(0, 1000));
-            } else if (action.type === "queue_status") {
-                const text = await runQueueStatus();
-                applied.push("checked the queue");
-                observations.push(text.slice(0, 800));
-            } else if (action.type === "queue_cancel") {
-                const text = await runQueueCancel(action);
-                applied.push(`cancelled (${action.scope})`);
-                observations.push(text.slice(0, 400));
-            } else if (action.type === "workflow_list") {
-                const text = await runWorkflowList();
-                applied.push("listed saved workflows");
-                observations.push(text.slice(0, 2000));
-            } else if (action.type === "workflow_save") {
-                const text = await runWorkflowSave(action);
-                applied.push(text.slice(0, 200));
-            } else if (action.type === "workflow_load") {
-                const text = await runWorkflowLoad(action);
-                applied.push(text.slice(0, 200));
-                observations.push(text.slice(0, 400));
-            } else if (action.type === "workflow_delete") {
-                const text = await runWorkflowDelete(action);
-                applied.push(text.slice(0, 200));
-            } else if (action.type === "clear_graph") {
-                const count = (app.graph?._nodes || []).length;
-                app.graph.clear();
-                applied.push(`cleared ${count} node(s)`);
-            } else if (action.type === "set_widget_value") {
-                const node = resolveNode(action.node_id);
-                if (!node) {
-                    rejected.push(t("missingNode", { node: action.node_id }));
-                    continue;
-                }
-                const widget = (node.widgets || []).find((item) => item.name === action.widget);
-                if (!widget) {
-                    rejected.push(t("missingWidget", { widget: action.widget, node: action.node_id }));
-                    continue;
-                }
-                try {
-                    const value = normalizeWidgetValue(widget, action.value);
-                    const previousValue = widget.value;
-                    widget.value = value;
-                    widget.callback?.(value, app.canvas, node);
-                    node.onWidgetChanged?.(widget.name, value, previousValue, widget);
-                    node.setDirtyCanvas?.(true, true);
-                    applied.push(t("nodeValue", { node: action.node_id, widget: widget.name, value: String(value).slice(0, 120) }));
-                } catch (error) {
-                    rejected.push(error.message);
-                }
-            } else if (action.type === "set_node_mode" && ["bypass", "enable"].includes(action.mode)) {
-                const node = resolveNode(action.node_id);
-                if (!node) {
-                    rejected.push(t("missingNode", { node: action.node_id }));
-                    continue;
-                }
-                node.mode = action.mode === "bypass" ? 4 : 0;
-                node.setDirtyCanvas?.(true, true);
-                applied.push(t("nodeMode", { node: action.node_id, mode: action.mode }));
-            } else {
-                rejected.push(t("unsupportedAction", { action: action.type || t("unknown") }));
-            }
-        } catch (error) {
-            rejected.push(error.message || String(error));
-        }
+    } finally {
+        endChange();
+        app.graph?.setDirtyCanvas?.(true, true);
+        if (highlightedNodes.size) clearHighlightsSoon();
     }
-    app.graph?.setDirtyCanvas?.(true, true);
     if (shouldQueue) {
-        const response = await api.fetchApi("/qwenvl/chat/unload", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ backend: modelBackend(), model: bareModel() }),
-        });
-        if (!response.ok) throw new Error(t("unloadError"));
-        await app.queuePrompt();
+        const promptId = await queueGraph();
         applied.push(t("workflowQueued"));
         queued = true;
+        activePromptId = promptId;
     }
-    return { applied, rejected, observations, queued };
+    return { applied, rejected, observations, queued, plan, promptId: activePromptId };
 }
 
 function setBusy(busy) {
@@ -1031,6 +1350,15 @@ function setBusy(busy) {
     for (const button of elements.languageButtons || []) button.disabled = busy;
     if (elements.removeAttachment) elements.removeAttachment.disabled = busy;
     elements.status?.classList.toggle("busy", busy);
+    // While a turn is in flight, watch the handoff so a cold model load or a
+    // running render shows as "loading model" / "generating, chat paused".
+    if (busy && !statusTimer) {
+        statusTimer = setInterval(pollStatus, 3000);
+        pollStatus();
+    } else if (!busy && statusTimer) {
+        clearInterval(statusTimer);
+        statusTimer = null;
+    }
 }
 
 function formatAnswer(message, applied, rejected) {
@@ -1074,10 +1402,10 @@ async function sendMessage() {
     }
     try {
         // Agent loop: act, observe (tool results feed back as OBSERVATION
-        // messages with a fresh graph snapshot), continue — up to 3 rounds.
-        // Observations earn extra rounds; bare rejections earn one retry.
-        // A queued workflow always ends the loop.
-        const MAX_ROUNDS = 3;
+        // messages with a fresh graph snapshot), continue. Observations earn
+        // extra rounds; bare rejections earn one retry. A queued workflow or a
+        // proposed plan always ends the loop.
+        const MAX_ROUNDS = 5;
         let data = null;
         let result = { applied: [], rejected: [], observations: [], queued: false };
         for (let round = 0; ; round++) {
@@ -1087,9 +1415,9 @@ async function sendMessage() {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 signal: controller.signal,
-                // Chat calls outlive ComfyUI frontend's default fetch timeout
-                // (cold model load alone is ~50s): only the Stop button aborts.
-                timeoutMs: null,
+                // Bound to just above the server's API_TIMEOUT_S (600s): a cold
+                // model load fits, and Stop still aborts through the controller.
+                timeoutMs: CHAT_TIMEOUT_MS,
                 body: JSON.stringify({
                     backend: modelBackend(),
                     model: bareModel(),
@@ -1111,11 +1439,12 @@ async function sendMessage() {
                     },
                 }),
             });
-            data = await response.json();
+            data = await parseJsonResponse(response);
             if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
             result = await applyActions(data.actions);
             const parsed = data.parsed === true;
-            const wantMore = !result.queued && round < MAX_ROUNDS - 1
+            // A suggested workflow ends the turn so the user sees the preview.
+            const wantMore = !result.queued && !result.plan && round < MAX_ROUNDS - 1
                 && (result.observations.length > 0 || !parsed || (result.rejected.length > 0 && round < 1));
             if (!wantMore) break;
             state.messages.push({ role: "assistant", content: formatAnswer(data.message, result.applied, result.rejected), thinking: data.thinking || "", choices: [] });
@@ -1130,23 +1459,30 @@ async function sendMessage() {
         }
         const answer = formatAnswer(data.message, result.applied, result.rejected);
         const responseActions = Array.isArray(data.actions) ? data.actions : [];
-        const promptWasSet = responseActions.some((action) => action.type === "set_widget_value" && ["prompt", "custom_prompt", "prompt_text"].includes(action.widget));
+        const promptWasSet = responseActions.some((action) => action.type === "set_widget_value" && ["prompt", "custom_prompt", "prompt_text", "text", "negative"].includes(action.widget));
         const workflowWasQueued = responseActions.some((action) => action.type === "queue_workflow");
         let choices = Array.isArray(data.choices) ? data.choices : [];
         if (!choices.length && promptWasSet && !workflowWasQueued) {
             choices = [{ label: t("generateVideo"), send: t("generateVideoSend") }];
         }
-        state.messages.push({ role: "assistant", content: answer, thinking: data.thinking || "", choices });
+        const assistantMessage = { role: "assistant", content: answer, thinking: data.thinking || "", choices };
+        if (result.plan) assistantMessage.plan = result.plan;
+        if (result.queued && result.promptId) {
+            assistantMessage.images = [];
+            queuedJobs.set(String(result.promptId), assistantMessage);
+        }
+        state.messages.push(assistantMessage);
         state.messages = state.messages.slice(-20);
         saveState();
         renderMessages();
-        setStatus(t("ready"));
+        setStatus(result.queued ? t("generating") : t("ready"));
     } catch (error) {
         if (error.name === "AbortError") setStatus(t("aborted"), true);
         else setStatus(error.message || String(error), true);
     } finally {
         controller = null;
         setBusy(false);
+        mirrorSession();
     }
 }
 
@@ -1250,6 +1586,14 @@ function buildSidebar(container) {
         .qwen-chat-status.error { color:#ff7777; opacity:1; }
         @keyframes qwen-chat-spin { to { transform:rotate(360deg); } }
         .qwen-chat-empty { margin:auto; max-width:280px; padding:20px; text-align:center; line-height:1.5; opacity:.55; }
+        .qwen-chat-plan { margin-top:10px; padding:10px 12px; border:1px solid rgba(109,124,255,.4); border-radius:11px; background:rgba(109,124,255,.08); }
+        .qwen-chat-plan-title { font-weight:650; font-size:12px; }
+        .qwen-chat-plan-summary { margin:6px 0; font-size:12px; opacity:.85; }
+        .qwen-chat-plan-nodes,.qwen-chat-plan-links { margin:4px 0; padding-left:18px; font-size:11px; font-family:monospace; opacity:.85; }
+        .qwen-chat-plan-build { margin-top:8px; cursor:pointer; font-size:12px; border-color:rgba(109,124,255,.55); background:rgba(109,124,255,.18); }
+        .qwen-chat-result-images { margin-top:10px; display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px; }
+        .qwen-chat-result-image { display:block; border-radius:9px; overflow:hidden; border:1px solid rgba(255,255,255,.12); }
+        .qwen-chat-result-image img { display:block; width:100%; aspect-ratio:1; object-fit:cover; background:#111; }
     `;
     container.append(style);
     const root = createElement("div", "qwen-chat");
@@ -1466,11 +1810,18 @@ function buildSidebar(container) {
     elements.input.addEventListener("blur", () => setTimeout(hideWildcardMenu, 150));
     renderMessages();
     loadModels();
+    restoreSession();
 }
 
 app.registerExtension({
     name: "QwenVL.WorkflowChat",
     async setup() {
+        // Progress and result images for a queued workflow come back over the
+        // ComfyUI websocket, keyed by prompt_id.
+        api.addEventListener("executed", onExecuted);
+        api.addEventListener("progress", onProgress);
+        api.addEventListener("executing", onExecuting);
+        api.addEventListener("execution_error", onExecutionError);
         app.extensionManager.registerSidebarTab({
             id: "qwenvl-workflow-chat",
             icon: "pi pi-comments",
