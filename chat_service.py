@@ -97,6 +97,10 @@ QUEUE_POLL_S = float(os.environ.get("QWENCHAT_QUEUE_POLL_S", "5"))
 FREE_POLL_S = float(os.environ.get("QWENCHAT_FREE_POLL_S", "1.5"))
 FREE_WAIT_S = float(os.environ.get("QWENCHAT_FREE_WAIT_S", "30"))
 FREE_VRAM_MIN_FRACTION = float(os.environ.get("QWENCHAT_MIN_FREE_VRAM_FRACTION", "0.90"))
+# Cap on waiting behind a running ComfyUI job. Without it a stuck or paused queue
+# spins forever and the panel's Stop button is the only exit. 10 minutes covers a
+# long render; past that the queue is stuck, not busy.
+IDLE_WAIT_S = float(os.environ.get("QWENCHAT_IDLE_WAIT_S", "600"))
 MINIMAX_I2VA_BINDING = "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
 
 
@@ -179,7 +183,7 @@ def normalize_minimax_output(text, preset_name, has_image=False, duration=None):
     return ensure_i2va_binding(prefix + tail.lstrip(), preset_name, has_image)
 
 
-_PROMPT_SOURCE = """You are Qwen Workflow Assistant inside ComfyUI. CRITICAL: your entire response must be exactly one JSON object — no text before or after it, no think tags, no analysis, no explanation. If you output anything besides JSON, the workflow will not be modified. Answer the user via the "message" field and, only when requested, control the open workflow using the supplied snapshot.
+_PROMPT_SOURCE = """You are Qwen Workflow Assistant inside ComfyUI, a live agent that edits the open workflow through tools. CRITICAL: act, do not describe. When tool calling is available, call the tools; otherwise return exactly one JSON object — no text before or after it, no think tags, no analysis, no explanation. If you neither call a tool nor output JSON, the workflow will not be modified. Answer the user via the "message" field and, only when requested, control the open workflow using the supplied snapshot.
 LANGUAGE: "message" and choice labels must mirror the LATEST user message language. Workflow prompt text must be English.
 OUTPUT: return exactly one JSON object, no text outside it:
 {"message":"reply","actions":[{"type":"set_widget_value","node_id":1,"widget":"steps","value":25},{"type":"queue_workflow"}],"choices":[{"label":"A","send":"text for A"}]}
@@ -447,6 +451,52 @@ def _norm_workflow_name(action):
     return None
 
 
+def _norm_workflow_rename(action):
+    name = _workflow_name(action.get("name"))
+    new_name = _workflow_name(action.get("new_name"))
+    if name and new_name:
+        return {"type": "workflow_rename", "name": name, "new_name": new_name}
+    return None
+
+
+def _norm_suggest_workflow(action):
+    summary = action.get("summary")
+    if not isinstance(summary, str) or not 0 < len(summary) <= 2000:
+        return None
+    steps = []
+    for step in (action.get("steps") or [])[:50]:
+        if not isinstance(step, dict):
+            continue
+        key = step.get("key")
+        node_type = step.get("node_type")
+        if not (isinstance(key, str) and 0 < len(key) <= 80 and isinstance(node_type, str) and 0 < len(node_type) <= 200):
+            continue
+        entry = {"key": key, "node_type": node_type}
+        if isinstance(step.get("title"), str) and step["title"]:
+            entry["title"] = step["title"][:200]
+        widgets = step.get("widgets")
+        if isinstance(widgets, dict):
+            entry["widgets"] = {
+                name[:200]: value
+                for name, value in list(widgets.items())[:50]
+                if isinstance(name, str) and (value is None or isinstance(value, (str, int, float, bool)))
+            }
+        steps.append(entry)
+    if not steps:
+        return None
+    links = []
+    for link in (action.get("links") or [])[:100]:
+        if not isinstance(link, dict):
+            continue
+        if (isinstance(link.get("from"), _REF) and isinstance(link.get("to"), _REF)
+                and isinstance(link.get("out"), (str, int)) and isinstance(link.get("in"), (str, int))):
+            links.append({"from": link["from"], "out": link["out"], "to": link["to"], "in": link["in"]})
+    entry = {"type": "suggest_workflow", "summary": summary, "steps": steps, "links": links}
+    if isinstance(action.get("title"), str) and action["title"]:
+        entry["title"] = action["title"][:200]
+    return entry
+
+
 def _obj(properties, required=()):
     return {
         "type": "object",
@@ -527,6 +577,45 @@ TOOLS = (
         "normalize": _norm_no_args,
     },
     {
+        "name": "list_nodes",
+        "summary": "List every node class the live server has installed, from /object_info.",
+        "schema": _obj({}),
+        "normalize": _norm_no_args,
+    },
+    {
+        "name": "list_models",
+        "summary": "List installed model files per folder (checkpoints, loras, vae, embeddings, controlnet) before swapping a loader or LoRA widget.",
+        "schema": _obj({}),
+        "normalize": _norm_no_args,
+    },
+    {
+        "name": "suggest_workflow",
+        "summary": "Propose a workflow as a plan; the panel shows a preview diff with a Build button before anything touches the canvas.",
+        "schema": _obj({
+            "summary": {"type": "string", "description": "What the workflow does, in the user's language."},
+            "title": {"type": "string"},
+            "steps": {
+                "type": "array",
+                "items": _obj({
+                    "key": {"type": "string"},
+                    "node_type": {"type": "string"},
+                    "title": {"type": "string"},
+                    "widgets": {"type": "object"},
+                }, ("key", "node_type")),
+            },
+            "links": {
+                "type": "array",
+                "items": _obj({
+                    "from": {"type": ["integer", "string"]},
+                    "out": {"type": ["string", "integer"]},
+                    "to": {"type": ["integer", "string"]},
+                    "in": {"type": ["string", "integer"]},
+                }, ("from", "out", "to", "in")),
+            },
+        }, ("summary", "steps")),
+        "normalize": _norm_suggest_workflow,
+    },
+    {
         "name": "queue_workflow",
         "summary": "Queue the current graph and show the result images in the chat.",
         "schema": _obj({}),
@@ -564,6 +653,15 @@ TOOLS = (
         "summary": "Open a saved workflow, replacing the canvas.",
         "schema": _obj({"name": {"type": "string"}}, ("name",)),
         "normalize": _norm_workflow_name,
+    },
+    {
+        "name": "workflow_rename",
+        "summary": "Rename one saved workflow; the old name must exist and the new name must be free.",
+        "schema": _obj({
+            "name": {"type": "string"},
+            "new_name": {"type": "string"},
+        }, ("name", "new_name")),
+        "normalize": _norm_workflow_rename,
     },
     {
         "name": "workflow_delete",
@@ -1154,7 +1252,36 @@ def installed_models_context():
     return text
 
 
-def build_prompt(messages, graph, enable_thinking=False, has_images=False, has_video=False):
+_nodetypes_cache = {"at": 0.0, "text": ""}
+NODETYPES_TTL_S = float(os.environ.get("QWENCHAT_NODETYPES_TTL_S", "120"))
+
+
+def node_types_context():
+    """Every node class the live server has installed, from GET /object_info, so
+    a suggested workflow can only name real nodes. Cached; empty string when the
+    server is unreachable (the panel still rejects unknown types at add time)."""
+    now = time.time()
+    if _nodetypes_cache["text"] and now - _nodetypes_cache["at"] < NODETYPES_TTL_S:
+        return _nodetypes_cache["text"]
+    try:
+        with urllib.request.urlopen(COMFY_URL.rstrip("/") + "/object_info", timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        print(f"[QwenVL Chat] /object_info unavailable ({error}); node list omitted")
+        return ""
+    names = sorted(name for name in (data or {}) if isinstance(name, str))
+    text = "INSTALLED NODES (%d; use only these class names for add_node):\n%s" % (len(names), ", ".join(names))
+    _nodetypes_cache.update(at=now, text=text)
+    return text
+
+
+def catalog():
+    """Installed node classes and installed model files, for the agent's
+    list_nodes and list_models tools. Both halves are best effort."""
+    return {"nodes": node_types_context(), "models": installed_models_context()}
+
+
+def build_prompt(messages, graph, enable_thinking=False, has_images=False, has_video=False, include_nodes=False):
     history = "\n".join(f"{item['role'].upper()}: {item['content']}" for item in messages)
     snapshot = json.dumps(graph, ensure_ascii=False, separators=(",", ":"))
     if len(snapshot) > GRAPH_SNAPSHOT_CHARS:
@@ -1166,6 +1293,10 @@ def build_prompt(messages, graph, enable_thinking=False, has_images=False, has_v
         instruction += "\nVIDEO INPUT: sampled frames from a video clip are attached to the latest user message. Treat them as the clip itself when the user asks to review, critique, or refine a generated video."
     if models_block:
         instruction += "\n\nINSTALLED MODELS — use these exact filenames in checkpoint/LoRA/VAE widgets (paths relative to their folders):\n" + models_block
+    if include_nodes:
+        nodes_block = node_types_context()
+        if nodes_block:
+            instruction += "\n\n" + nodes_block
     return f"{instruction}\n\nWORKFLOW SNAPSHOT:\n{snapshot}\n\nCONVERSATION:\n{history}\n\nJSON RESPONSE:"
 
 
@@ -1588,6 +1719,53 @@ def _llamaswap_running():
     return names
 
 
+def _llamaswap_states():
+    """llama-swap's running models with their state, or None when unreachable.
+    The panel uses this to show "loading model" during a cold load."""
+    try:
+        with urllib.request.urlopen(LLAMA_SWAP_URL.rstrip("/") + "/running", timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    models = data.get("running") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return None
+    return [
+        {"model": entry["model"], "state": str(entry.get("state") or "")}
+        for entry in models
+        if isinstance(entry, dict) and isinstance(entry.get("model"), str)
+    ]
+
+
+# Last failed POST /free, surfaced through /qwenvl/chat/status so a fail-open
+# free is visible instead of silent.
+_LAST_FREE_ERROR = {"at": 0.0, "error": ""}
+
+
+def chat_status():
+    """A small handoff snapshot for the panel: whether ComfyUI is generating,
+    whether llama-swap is loading a model, and the last /free failure. Every
+    source is best effort; a down service just drops out of the answer."""
+    comfy_busy = _comfy_queue_busy()
+    states = _llamaswap_states()
+    loading = any("start" in (state.get("state") or "").lower() for state in (states or []))
+    vram = _comfy_vram_free()
+    if comfy_busy:
+        state = "generating"
+    elif loading:
+        state = "loading"
+    else:
+        state = "idle"
+    return {
+        "state": state,
+        "comfy_busy": comfy_busy,
+        "llamaswap": states or [],
+        "vram_free": int(vram[0]) if vram else None,
+        "vram_total": int(vram[1]) if vram else None,
+        "free_error": _LAST_FREE_ERROR["error"] or None,
+    }
+
+
 def _comfy_free(model_name=None):
     """Make room on the shared card for the api chat model.
 
@@ -1616,8 +1794,14 @@ def _comfy_free(model_name=None):
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(request, timeout=30) as response:
             response.read()
+        _LAST_FREE_ERROR.update(at=time.time(), error="")
     except Exception as error:
-        print(f"[QwenVL Chat] ComfyUI /free failed ({error})")
+        # Fail open (chat continues), but record and log it: a /free that did
+        # nothing is the state that produced the "upstream command exited
+        # prematurely" crash, and the panel shows this through /chat/status.
+        message = f"ComfyUI /free failed ({error}); the card may still hold diffusion weights"
+        _LAST_FREE_ERROR.update(at=time.time(), error=message)
+        print(f"[QwenVL Chat] {message}")
         return
     stats = _comfy_vram_free()
     if stats is None:
@@ -1647,7 +1831,13 @@ def _comfy_free(model_name=None):
 def _await_comfy_idle(model_name=None):
     if not WAIT_FOR_IDLE:
         return
+    deadline = time.time() + IDLE_WAIT_S
     while _comfy_queue_busy():
+        if time.time() >= deadline:
+            raise ValueError(
+                f"ComfyUI's queue is still busy after {int(IDLE_WAIT_S)}s"
+                " (a job is running or stuck). Wait for it to finish or stop it, then send again."
+            )
         time.sleep(QUEUE_POLL_S)
     _comfy_free(model_name)
 
@@ -1688,6 +1878,42 @@ def _api_models():
     ordered = [API_DEFAULT_MODEL] + sorted(names - {API_DEFAULT_MODEL})
     _api_models_cache.update(at=now, names=ordered)
     return list(ordered)
+
+
+# Conversation checkpoint. The panel is the source of truth (localStorage); this
+# is the durable copy that survives a GPU handoff, a reload or another browser.
+_SESSIONS = {}
+SESSION_MAX = 32
+SESSION_TTL_S = float(os.environ.get("QWENCHAT_SESSION_TTL_S", str(8 * 3600)))
+
+
+def _prune_sessions(now):
+    for key in [key for key, entry in _SESSIONS.items() if now - entry["at"] > SESSION_TTL_S]:
+        _SESSIONS.pop(key, None)
+    while len(_SESSIONS) > SESSION_MAX:
+        oldest = min(_SESSIONS, key=lambda key: _SESSIONS[key]["at"])
+        _SESSIONS.pop(oldest, None)
+
+
+def save_session(session_id, messages, model=""):
+    if not isinstance(session_id, str) or not 0 < len(session_id) <= 80:
+        raise ValueError("invalid session id")
+    if not isinstance(messages, list):
+        raise ValueError("invalid session messages")
+    cleaned = []
+    for item in messages[-MAX_MESSAGES:]:
+        if isinstance(item, dict) and item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str):
+            cleaned.append({"role": item["role"], "content": item["content"][:MAX_MESSAGE_CHARS]})
+    _SESSIONS[session_id] = {"at": time.time(), "messages": cleaned, "model": str(model)[:200]}
+    _prune_sessions(time.time())
+    return {"messages": len(cleaned)}
+
+
+def load_session(session_id):
+    entry = _SESSIONS.get(session_id) if isinstance(session_id, str) else None
+    if not entry or time.time() - entry["at"] > SESSION_TTL_S:
+        return {"messages": [], "model": ""}
+    return {"messages": entry["messages"], "model": entry["model"]}
 
 
 CIVITAI_API = "https://api.civitai.com/v1/models"
@@ -1983,7 +2209,7 @@ class ChatRuntime:
             # and the parser cannot repair it.
             options["max_tokens"] = max(int(options.get("max_tokens", 1024)), 4096)
         base_max_tokens = int(options.get("max_tokens", 1024))
-        prompt = build_prompt(messages, graph, enable_thinking, bool(images), bool(video))
+        prompt = build_prompt(messages, graph, enable_thinking, bool(images), bool(video), backend == "api")
         with self._lock:
             text, finish_reason = self._generate(backend, model_name, prompt, options, enable_thinking, images, video)
         MAX_JSON_ATTEMPTS = 3
@@ -2019,7 +2245,7 @@ class ChatRuntime:
                 {"role": "assistant", "content": (text or "")[:2000]},
                 {"role": "user", "content": opener + "Your reply was not a JSON object and applied no workflow changes. " + reminder},
             ]
-            retry_prompt = build_prompt(retry_messages, graph, enable_thinking, bool(images), bool(video))
+            retry_prompt = build_prompt(retry_messages, graph, enable_thinking, bool(images), bool(video), backend == "api")
             with self._lock:
                 retry_text, finish_reason = self._generate(backend, model_name, retry_prompt, retry_options, enable_thinking, images, video)
             text = retry_text

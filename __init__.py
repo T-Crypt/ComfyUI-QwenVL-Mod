@@ -92,6 +92,7 @@ if os.path.exists(nodes_dir):
     load_modules_from_directory(nodes_dir)
 
 from chat_service import CHAT_RUNTIME, list_output_images, TOOL_SCHEMAS
+from chat_service import catalog, chat_status, load_session, save_session
 from chat_service import DOWNLOAD_KINDS, civitai_search, download_model
 
 
@@ -119,6 +120,34 @@ async def _chat_models(request):
 @PromptServer.instance.routes.get("/qwenvl/chat/tools")
 async def _chat_tools(request):
     return web.json_response({"tools": TOOL_SCHEMAS})
+
+
+@PromptServer.instance.routes.get("/qwenvl/chat/catalog")
+async def _chat_catalog(request):
+    return web.json_response(await asyncio.to_thread(catalog))
+
+
+@PromptServer.instance.routes.get("/qwenvl/chat/status")
+async def _chat_status(request):
+    return web.json_response(await asyncio.to_thread(chat_status))
+
+
+@PromptServer.instance.routes.post("/qwenvl/chat/session")
+async def _chat_session_save(request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("request body must be an object")
+        result = await asyncio.to_thread(
+            save_session, data.get("session_id"), data.get("messages"), data.get("model") or "")
+        return web.json_response({"status": "success", **result})
+    except ValueError as error:
+        return web.json_response({"error": str(error)}, status=400)
+
+
+@PromptServer.instance.routes.get("/qwenvl/chat/session")
+async def _chat_session_load(request):
+    return web.json_response(await asyncio.to_thread(load_session, request.query.get("session_id")))
 
 
 @PromptServer.instance.routes.get("/qwenvl/chat/assets")

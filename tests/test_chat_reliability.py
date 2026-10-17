@@ -37,6 +37,10 @@ CHAT_ROUTES = {
 
 SIBLING_ROUTES = {
     ("POST", "/qwenvl/chat/unload"): "_chat_unload",
+    ("GET", "/qwenvl/chat/status"): "_chat_status",
+    ("GET", "/qwenvl/chat/catalog"): "_chat_catalog",
+    ("GET", "/qwenvl/chat/session"): "_chat_session_load",
+    ("POST", "/qwenvl/chat/session"): "_chat_session_save",
     ("GET", "/qwenvl/models/search"): "_models_search",
     ("POST", "/qwenvl/models/download"): "_models_download",
 }
@@ -405,6 +409,82 @@ class ApiModelListTests(unittest.TestCase):
             _api_models()
             _api_models()
         self.assertEqual(urlopen.call_count, 1)
+
+
+class SessionCheckpointTests(unittest.TestCase):
+    """The server-side conversation copy that outlives a GPU handoff."""
+
+    def setUp(self):
+        import chat_service as cs
+        cs._SESSIONS.clear()
+
+    def test_round_trip_drops_unknown_roles(self):
+        import chat_service as cs
+        cs.save_session("s1", [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "yo"},
+            {"role": "system", "content": "drop me"},
+        ], "NInfer-HauHauCS-27B")
+        loaded = cs.load_session("s1")
+        self.assertEqual([m["content"] for m in loaded["messages"]], ["hi", "yo"])
+        self.assertEqual(loaded["model"], "NInfer-HauHauCS-27B")
+        self.assertEqual(cs.load_session("missing")["messages"], [])
+
+    def test_rejects_a_bad_session_id_or_payload(self):
+        import chat_service as cs
+        for session_id, messages in (("", []), ("x" * 81, []), ("ok", "not a list")):
+            with self.subTest(session_id=session_id), self.assertRaises(ValueError):
+                cs.save_session(session_id, messages)
+
+
+class ChatStatusTests(unittest.TestCase):
+    """The handoff banner reads best-effort sources and never raises."""
+
+    def setUp(self):
+        import chat_service as cs
+        cs._LAST_FREE_ERROR.update(at=0.0, error="")
+
+    def test_loading_state_when_llama_swap_is_starting(self):
+        import chat_service as cs
+
+        def route(request, timeout=None):
+            url = getattr(request, "full_url", str(request))
+            if url.endswith("/queue"):
+                return _json_response({"queue_running": [], "queue_pending": []})
+            if url.endswith("/running"):
+                return _json_response({"running": [{"model": "NInfer-HauHauCS-27B", "state": "starting"}]})
+            return _json_response({"devices": [{"vram_free": 24 * 2**30, "vram_total": 24 * 2**30}]})
+
+        with patch("urllib.request.urlopen", side_effect=route):
+            status = cs.chat_status()
+        self.assertEqual(status["state"], "loading")
+        self.assertFalse(status["comfy_busy"])
+        self.assertEqual(status["vram_free"], 24 * 2**30)
+        self.assertIsNone(status["free_error"])
+
+    def test_generating_state_when_comfy_queue_is_busy(self):
+        import chat_service as cs
+
+        def route(request, timeout=None):
+            url = getattr(request, "full_url", str(request))
+            if url.endswith("/queue"):
+                return _json_response({"queue_running": [[0, "abc"]], "queue_pending": []})
+            if url.endswith("/running"):
+                return _json_response({"running": []})
+            return _json_response({"devices": [{"vram_free": 3 * 2**30, "vram_total": 24 * 2**30}]})
+
+        with patch("urllib.request.urlopen", side_effect=route):
+            status = cs.chat_status()
+        self.assertEqual(status["state"], "generating")
+
+    def test_free_failure_is_surfaced(self):
+        import chat_service as cs
+        cs._LAST_FREE_ERROR.update(at=0.0, error="")
+        with patch("chat_service._llamaswap_running", return_value=set()), \
+                patch("urllib.request.urlopen", side_effect=OSError("boom")):
+            cs._comfy_free("NInfer-HauHauCS-27B")
+        status = cs.chat_status()
+        self.assertIn("/free failed", status["free_error"] or "")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,15 @@
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
+
+import chat_service as _cs
 
 from chat_service import (
     ChatRuntime,
@@ -31,6 +35,65 @@ from chat_service import (
     ensure_i2va_binding,
     normalize_minimax_output,
 )
+
+
+def setUpModule():
+    # Keep the offline suite offline: an api chat turn would otherwise fetch
+    # /object_info on every build_prompt call. NodeTypesContextTests resets and
+    # restores this stub around its own mocked fetch.
+    _cs._nodetypes_cache.update(at=time.time(), text="INSTALLED NODES (stubbed for the offline suite)")
+
+
+def tearDownModule():
+    _cs._nodetypes_cache.update(at=0.0, text="")
+
+
+class NodeTypesContextTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(_cs._nodetypes_cache)
+        _cs._nodetypes_cache.update(at=0.0, text="")
+
+    def tearDown(self):
+        _cs._nodetypes_cache.update(**self.saved)
+
+    def test_lists_installed_node_classes(self):
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps({"KSampler": {}, "CLIPTextEncode": {}}).encode()
+
+        with unittest.mock.patch.object(_cs.urllib.request, "urlopen", return_value=_Resp()):
+            text = _cs.node_types_context()
+        self.assertIn("KSampler", text)
+        self.assertIn("CLIPTextEncode", text)
+
+    def test_returns_empty_when_object_info_is_unavailable(self):
+        with unittest.mock.patch.object(_cs.urllib.request, "urlopen", side_effect=OSError("down")):
+            self.assertEqual(_cs.node_types_context(), "")
+
+    def test_build_prompt_includes_nodes_only_when_asked(self):
+        with unittest.mock.patch.object(_cs, "node_types_context", return_value="ZZ_NODES_SENTINEL_ZZ KSampler"):
+            with_nodes = _cs.build_prompt([{"role": "user", "content": "x"}], {"nodes": []}, include_nodes=True)
+            without_nodes = _cs.build_prompt([{"role": "user", "content": "x"}], {"nodes": []})
+        self.assertIn("ZZ_NODES_SENTINEL_ZZ", with_nodes)
+        self.assertNotIn("ZZ_NODES_SENTINEL_ZZ", without_nodes)
+
+    def test_catalog_reports_nodes_and_models(self):
+        saved = dict(_cs._nodetypes_cache)
+        _cs._nodetypes_cache.update(at=0.0, text="")
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps({"KSampler": {}}).encode()
+
+        try:
+            with unittest.mock.patch.object(_cs.urllib.request, "urlopen", return_value=_Resp()):
+                data = _cs.catalog()
+        finally:
+            _cs._nodetypes_cache.update(**saved)
+        self.assertIn("KSampler", data["nodes"])
+        self.assertIsInstance(data["models"], str)
 
 
 class ChatProtocolTests(unittest.TestCase):
@@ -1016,6 +1079,33 @@ class AgentToolRegistryTests(unittest.TestCase):
         with mock.patch.object(cs.urllib.request, "urlopen", side_effect=fake_urlopen):
             cs._api_chat_completions("SYS", "PROMPT", [], "M", {})
         self.assertNotIn("tools", captured["body"])
+
+
+    def test_accepts_catalog_tools(self):
+        self.assertEqual(
+            validate_actions([{"type": "list_nodes"}, {"type": "list_models"}]),
+            [{"type": "list_nodes"}, {"type": "list_models"}])
+
+    def test_rejects_malformed_rename_and_suggest(self):
+        self.assertEqual(validate_actions([
+            {"type": "workflow_rename", "name": "a/b", "new_name": "ok"},
+            {"type": "workflow_rename", "name": "ok"},
+            {"type": "suggest_workflow", "summary": "", "steps": [{"key": "k", "node_type": "N"}]},
+            {"type": "suggest_workflow", "summary": "x", "steps": []},
+            {"type": "suggest_workflow", "summary": "x", "steps": [{"key": "k"}]},
+        ]), [])
+
+    def test_accepts_workflow_rename_and_suggest(self):
+        actions = validate_actions([
+            {"type": "workflow_rename", "name": "old one", "new_name": "new one.json"},
+            {"type": "suggest_workflow", "summary": "A portrait graph",
+             "steps": [{"key": "k1", "node_type": "KSampler", "widgets": {"steps": 20}},
+                       {"key": "k2", "node_type": "VAEDecode"}],
+             "links": [{"from": "k1", "out": "LATENT", "to": "k2", "in": "samples"}]},
+        ])
+        self.assertEqual(actions[0], {"type": "workflow_rename", "name": "old one", "new_name": "new one"})
+        self.assertEqual(actions[1]["steps"][0], {"key": "k1", "node_type": "KSampler", "widgets": {"steps": 20}})
+        self.assertEqual(actions[1]["links"][0], {"from": "k1", "out": "LATENT", "to": "k2", "in": "samples"})
 
 
 if __name__ == "__main__":
